@@ -31,6 +31,9 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #include "main_FIX.h"
 #include "stack_alloc.h"
+#ifdef OPUS_BENCH_STAGE_PROFILE
+#include "opus_bench_profile.h"
+#endif
 
 void silk_find_pred_coefs_FIX(
     silk_encoder_state_FIX          *psEnc,                                 /* I/O  encoder state                                                               */
@@ -48,6 +51,9 @@ void silk_find_pred_coefs_FIX(
     opus_int16       *x_pre_ptr;
     VARDECL( opus_int16, LPC_in_pre );
     opus_int32       min_gain_Q16, minInvGain_Q30;
+#ifdef OPUS_BENCH_STAGE_PROFILE
+    uint32_t profile_start;
+#endif
     SAVE_STACK;
 
     /* weighting for weighted least squares */
@@ -87,6 +93,7 @@ void silk_find_pred_coefs_FIX(
         ALLOC( XXLTP_Q17, psEnc->sCmn.nb_subfr * LTP_ORDER * LTP_ORDER, opus_int32 );
 
         /* LTP analysis */
+        profile_start = opus_bench_profile_now();
         silk_find_LTP_FIX( XXLTP_Q17, xXLTP_Q17, res_pitch,
             psEncCtrl->pitchL, psEnc->sCmn.subfr_length, psEnc->sCmn.nb_subfr, psEnc->sCmn.arch );
 
@@ -100,6 +107,7 @@ void silk_find_pred_coefs_FIX(
         /* Create LTP residual */
         silk_LTP_analysis_filter_FIX( LPC_in_pre, x - psEnc->sCmn.predictLPCOrder, psEncCtrl->LTPCoef_Q14,
             psEncCtrl->pitchL, invGains_Q16, psEnc->sCmn.subfr_length, psEnc->sCmn.nb_subfr, psEnc->sCmn.predictLPCOrder );
+        opus_bench_profile_record(OPUS_BENCH_STAGE_PRED_LTP, profile_start);
 
     } else {
         /************/
@@ -132,14 +140,20 @@ void silk_find_pred_coefs_FIX(
     }
 
     /* LPC_in_pre contains the LTP-filtered input for voiced, and the unfiltered input for unvoiced */
+    profile_start = opus_bench_profile_now();
     silk_find_LPC_FIX( &psEnc->sCmn, NLSF_Q15, LPC_in_pre, minInvGain_Q30 );
+    opus_bench_profile_record(OPUS_BENCH_STAGE_PRED_LPC, profile_start);
 
     /* Quantize LSFs */
+    profile_start = opus_bench_profile_now();
     silk_process_NLSFs( &psEnc->sCmn, psEncCtrl->PredCoef_Q12, NLSF_Q15, psEnc->sCmn.prev_NLSFq_Q15 );
+    opus_bench_profile_record(OPUS_BENCH_STAGE_PRED_NLSF, profile_start);
 
     /* Calculate residual energy using quantized LPC coefficients */
+    profile_start = opus_bench_profile_now();
     silk_residual_energy_FIX( psEncCtrl->ResNrg, psEncCtrl->ResNrgQ, LPC_in_pre, psEncCtrl->PredCoef_Q12, local_gains,
         psEnc->sCmn.subfr_length, psEnc->sCmn.nb_subfr, psEnc->sCmn.predictLPCOrder, psEnc->sCmn.arch );
+    opus_bench_profile_record(OPUS_BENCH_STAGE_PRED_RESIDUAL, profile_start);
 
     /* Copy to prediction struct for use in next frame for interpolation */
     silk_memcpy( psEnc->sCmn.prev_NLSFq_Q15, NLSF_Q15, sizeof( psEnc->sCmn.prev_NLSFq_Q15 ) );

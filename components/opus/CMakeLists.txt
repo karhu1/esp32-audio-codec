@@ -61,10 +61,12 @@ idf_component_register(
 if(NOT CMAKE_BUILD_EARLY_EXPANSION)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE
         OPUS_BUILD
+        OPUS_XTENSA_LX7
         FIXED_POINT=1
         NONTHREADSAFE_PSEUDOSTACK
         GLOBAL_STACK_SIZE=60000
         HAVE_LRINT
         HAVE_LRINTF
+        OPUS_BENCH_STAGE_PROFILE
     )
 endif()

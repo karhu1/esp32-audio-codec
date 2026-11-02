@@ -29,6 +29,7 @@
 #include "esp_rom_sys.h"    // esp_rom_get_cpu_ticks_per_us()
 #include "esp_heap_caps.h"  // heap_caps_get_free_size()
 #include "opus.h"
+#include "opus_bench_profile.h"
 
 // ---- Test parameters -------------------------------------------------------
 #define SAMPLE_RATE_HZ        16000
@@ -79,6 +80,7 @@ typedef struct {
 } result_t;
 
 static result_t g_res[NUM_COMPLEXITIES];
+static opus_bench_profile_t g_stage_profile;
 
 // ---- Test signal -----------------------------------------------------------
 // A "voiced speech" stand-in: a wobbling-pitch harmonic series with a slow
@@ -201,9 +203,15 @@ static void run_config(int complexity, result_t *r)
             if ((f % 10) == 9) vTaskDelay(1);
         }
 
-        if (pass == -1)          ref_hash = hash;
+        if (pass == -1) {
+            ref_hash = hash;
+            /* Exclude warm-up work from the reported stage profile. */
+            opus_bench_profile_reset();
+        }
         else if (hash != ref_hash) r->deterministic = false;
     }
+
+    opus_bench_profile_read(&g_stage_profile);
 
     r->hash = ref_hash;
     if (r->timed_frames > 0) r->avg_cycles = (uint32_t)(sum_cycles / r->timed_frames);
@@ -221,6 +229,34 @@ static void print_per_frame(int complexity, const uint32_t cpu_mhz)
         printf("%d, %" PRIu32 ", %.1f, %u, %u\n", f, avg,
                (float)avg / (float)cpu_mhz, (unsigned)g_frame_bytes[f], (unsigned)g_frame_config[f]);
     }
+}
+
+static void print_stage_profile(void)
+{
+    static const char *const names[OPUS_BENCH_STAGE_COUNT] = {
+        "pitch analysis", "noise-shape analysis", "predictor search",
+        "gain processing", "NSQ quantizer", "entropy encoding", "LBRR total",
+        "predictor: LTP", "predictor: LPC", "predictor: NLSF quantization",
+        "predictor: residual energy", "SILK frame total", "SILK API call total",
+        "Opus tonality analysis", "Opus frame processing",
+        "tonality: feature analysis", "tonality: result aggregation",
+        "tonality: FFT", "tonality: phase/atan2 loop", "tonality: neural model",
+        "tonality: input preparation", "tonality: post-phase features",
+        "tonality: band statistics", "tonality: leakage", "tonality: spectral variability",
+        "tonality: bandwidth", "tonality: DCT/features"
+    };
+
+    printf("\n--- SILK stage profile, complexity 10 (%u timed frames) ---\n",
+           (unsigned)g_res[NUM_COMPLEXITIES - 1].timed_frames);
+    printf("stage, total_cycles, avg_cycles/call, calls\n");
+    for (int i = 0; i < OPUS_BENCH_STAGE_COUNT; i++) {
+        uint64_t per_call = g_stage_profile.calls[i]
+            ? g_stage_profile.cycles[i] / g_stage_profile.calls[i] : 0;
+        printf("%s, %" PRIu64 ", %" PRIu64 ", %" PRIu32 "\n",
+               names[i], g_stage_profile.cycles[i], per_call,
+               g_stage_profile.calls[i]);
+    }
+    printf("(Parent and child totals overlap: predictor, SILK frame, SILK API, and Opus frame totals are inclusive. LBRR overlaps its own quantization and entropy work.)\n");
 }
 
 // ---- Benchmark task --------------------------------------------------------
@@ -243,6 +279,8 @@ static void bench_task(void *arg)
         if (!g_res[i].ok) break;
         if (k_complexities[i] == PER_FRAME_LOG_COMPLEXITY) print_per_frame(k_complexities[i], cpu_mhz);
     }
+
+    if (g_res[NUM_COMPLEXITIES - 1].ok) print_stage_profile();
 
     printf("\n===== Opus encode benchmark: complexity sweep =====\n");
     printf("CPU clock           : %u MHz\n", (unsigned)cpu_mhz);

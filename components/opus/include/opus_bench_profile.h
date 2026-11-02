@@ -1,0 +1,48 @@
+/* Temporary SILK stage profiling interface for the ESP32 benchmark. */
+#ifndef OPUS_BENCH_PROFILE_H
+#define OPUS_BENCH_PROFILE_H
+
+#include <stdint.h>
+
+typedef enum {
+    OPUS_BENCH_STAGE_PITCH,
+    OPUS_BENCH_STAGE_NOISE_SHAPE,
+    OPUS_BENCH_STAGE_PREDICTORS,
+    OPUS_BENCH_STAGE_GAINS,
+    OPUS_BENCH_STAGE_NSQ,
+    OPUS_BENCH_STAGE_ENTROPY,
+    OPUS_BENCH_STAGE_LBRR,
+    OPUS_BENCH_STAGE_PRED_LTP,
+    OPUS_BENCH_STAGE_PRED_LPC,
+    OPUS_BENCH_STAGE_PRED_NLSF,
+    OPUS_BENCH_STAGE_PRED_RESIDUAL,
+    OPUS_BENCH_STAGE_FRAME_TOTAL,
+    OPUS_BENCH_STAGE_SILK_API,
+    OPUS_BENCH_STAGE_OPUS_ANALYSIS,
+    OPUS_BENCH_STAGE_OPUS_FRAME,
+    OPUS_BENCH_STAGE_TONALITY_FRAME,
+    OPUS_BENCH_STAGE_TONALITY_INFO,
+    OPUS_BENCH_STAGE_TONALITY_FFT,
+    OPUS_BENCH_STAGE_TONALITY_PHASE,
+    OPUS_BENCH_STAGE_TONALITY_MODEL,
+    OPUS_BENCH_STAGE_TONALITY_INPUT,
+    OPUS_BENCH_STAGE_TONALITY_POST_PHASE,
+    OPUS_BENCH_STAGE_TONALITY_BAND_STATS,
+    OPUS_BENCH_STAGE_TONALITY_LEAKAGE,
+    OPUS_BENCH_STAGE_TONALITY_VARIABILITY,
+    OPUS_BENCH_STAGE_TONALITY_BANDWIDTH,
+    OPUS_BENCH_STAGE_TONALITY_DCT,
+    OPUS_BENCH_STAGE_COUNT
+} opus_bench_stage_t;
+
+typedef struct {
+    uint64_t cycles[OPUS_BENCH_STAGE_COUNT];
+    uint32_t calls[OPUS_BENCH_STAGE_COUNT];
+} opus_bench_profile_t;
+
+void opus_bench_profile_reset(void);
+void opus_bench_profile_read(opus_bench_profile_t *profile);
+uint32_t opus_bench_profile_now(void);
+void opus_bench_profile_record(opus_bench_stage_t stage, uint32_t start);
+
+#endif

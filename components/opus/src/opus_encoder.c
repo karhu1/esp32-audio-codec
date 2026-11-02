@@ -45,6 +45,9 @@
 #include "analysis.h"
 #include "mathops.h"
 #include "tuning_parameters.h"
+#ifdef OPUS_BENCH_STAGE_PROFILE
+#include "opus_bench_profile.h"
+#endif
 
 #ifdef ENABLE_DRED
 #include "dred_coding.h"
@@ -1209,6 +1212,9 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_res *pcm, int frame_si
     opus_val16 stereo_width;
     const CELTMode *celt_mode=NULL;
     int packet_size_cap = 1276;
+#ifdef OPUS_BENCH_STAGE_PROFILE
+    opus_uint32 opus_profile_start;
+#endif
 #ifndef DISABLE_FLOAT_API
     AnalysisInfo analysis_info;
     int analysis_read_pos_bak=-1;
@@ -1261,9 +1267,11 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_res *pcm, int frame_si
     {
        analysis_read_pos_bak = st->analysis.read_pos;
        analysis_read_subframe_bak = st->analysis.read_subframe;
+       opus_profile_start = opus_bench_profile_now();
        run_analysis(&st->analysis, celt_mode, analysis_pcm, analysis_size, frame_size,
              c1, c2, analysis_channels, st->Fs,
              lsb_depth, downmix, &analysis_info);
+       opus_bench_profile_record(OPUS_BENCH_STAGE_OPUS_ANALYSIS, opus_profile_start);
 
     } else if (st->analysis.initialized) {
        tonality_analysis_reset(&st->analysis);
@@ -1823,6 +1831,7 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_res *pcm, int frame_si
 #endif
           is_silence = is_digital_silence(pcm+i*(st->channels*enc_frame_size), enc_frame_size, st->channels, lsb_depth);
 
+          opus_profile_start = opus_bench_profile_now();
           tmp_len = opus_encode_frame_native(st, pcm+i*(st->channels*enc_frame_size), enc_frame_size, curr_data, curr_max, float_api, first_frame,
 #ifdef ENABLE_DRED
                     dred_bitrate_bps,
@@ -1833,6 +1842,7 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_res *pcm, int frame_si
                     is_silence, frame_redundancy, celt_to_silk, prefill,
                     equiv_rate, frame_to_celt
               );
+          opus_bench_profile_record(OPUS_BENCH_STAGE_OPUS_FRAME, opus_profile_start);
           if (tmp_len<0)
           {
              RESTORE_STACK;
@@ -1859,6 +1869,7 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_res *pcm, int frame_si
        RESTORE_STACK;
        return ret;
     } else {
+      opus_profile_start = opus_bench_profile_now();
       ret = opus_encode_frame_native(st, pcm, frame_size, data, max_data_bytes, float_api, 1,
 #ifdef ENABLE_DRED
                 dred_bitrate_bps,
@@ -1869,6 +1880,7 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_res *pcm, int frame_si
                 is_silence, redundancy, celt_to_silk, prefill,
                 equiv_rate, to_celt
           );
+      opus_bench_profile_record(OPUS_BENCH_STAGE_OPUS_FRAME, opus_profile_start);
       RESTORE_STACK;
       return ret;
     }
@@ -2225,13 +2237,25 @@ static opus_int32 opus_encode_frame_native(OpusEncoder *st, const opus_res *pcm,
                   0, Q15ONE, celt_mode->overlap, st->Fs/400, st->channels, celt_mode->window, st->Fs);
             OPUS_CLEAR(st->delay_buffer, prefill_offset);
             pcm_silk = st->delay_buffer;
+#ifdef OPUS_BENCH_STAGE_PROFILE
+            opus_uint32 silk_prefill_profile_start = opus_bench_profile_now();
+#endif
             silk_Encode( silk_enc, &st->silk_mode, pcm_silk, st->encoder_buffer, NULL, &zero, prefill, activity );
+#ifdef OPUS_BENCH_STAGE_PROFILE
+            opus_bench_profile_record(OPUS_BENCH_STAGE_SILK_API, silk_prefill_profile_start);
+#endif
             /* Prevent a second switch in the real encode call. */
             st->silk_mode.opusCanSwitch = 0;
         }
 
         pcm_silk = pcm_buf+total_buffer*st->channels;
+#ifdef OPUS_BENCH_STAGE_PROFILE
+        opus_uint32 silk_profile_start = opus_bench_profile_now();
+#endif
         ret = silk_Encode( silk_enc, &st->silk_mode, pcm_silk, frame_size, &enc, &nBytes, 0, activity );
+#ifdef OPUS_BENCH_STAGE_PROFILE
+        opus_bench_profile_record(OPUS_BENCH_STAGE_SILK_API, silk_profile_start);
+#endif
         if( ret ) {
             /*fprintf (stderr, "SILK encode error: %d\n", ret);*/
             /* Handle error */

@@ -33,6 +33,46 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "main_FIX.h"
 #include "stack_alloc.h"
 #include "tuning_parameters.h"
+#ifdef OPUS_BENCH_STAGE_PROFILE
+#include "opus_bench_profile.h"
+
+static opus_bench_profile_t opus_bench_profile;
+
+uint32_t opus_bench_profile_now(void)
+{
+    uint32_t cycles;
+    __asm__ volatile("rsr.ccount %0" : "=a"(cycles));
+    return cycles;
+}
+
+void opus_bench_profile_record(opus_bench_stage_t stage, uint32_t start)
+{
+    opus_bench_profile.cycles[stage] += (uint32_t)(opus_bench_profile_now() - start);
+    opus_bench_profile.calls[stage]++;
+}
+
+void opus_bench_profile_reset(void)
+{
+    silk_memset(&opus_bench_profile, 0, sizeof(opus_bench_profile));
+}
+
+void opus_bench_profile_read(opus_bench_profile_t *profile)
+{
+    silk_memcpy(profile, &opus_bench_profile, sizeof(*profile));
+}
+#endif
+
+#ifdef OPUS_BENCH_STAGE_PROFILE
+#define OPUS_BENCH_PROFILE_BEGIN() \
+    opus_uint32 opus_bench_start; \
+    opus_uint32 opus_bench_frame_start = opus_bench_profile_now()
+#define OPUS_BENCH_PROFILE_START() (opus_bench_start = opus_bench_profile_now())
+#define OPUS_BENCH_PROFILE_END(stage) opus_bench_profile_record((stage), opus_bench_start)
+#else
+#define OPUS_BENCH_PROFILE_BEGIN()
+#define OPUS_BENCH_PROFILE_START() ((void)0)
+#define OPUS_BENCH_PROFILE_END(stage) ((void)0)
+#endif
 
 /* Low Bitrate Redundancy (LBRR) encoding. Reuse all parameters but encode with lower bitrate           */
 static OPUS_INLINE void silk_LBRR_encode_FIX(
@@ -106,6 +146,7 @@ opus_int silk_encode_frame_FIX(
     opus_int16   best_gain_mult[ MAX_NB_SUBFR ];
     opus_int     best_sum[ MAX_NB_SUBFR ];
     opus_int     bits_margin;
+    OPUS_BENCH_PROFILE_BEGIN();
     SAVE_STACK;
 
     /* Using ALLOC() instead of a regular stack allocation to minimize real stack use when using the pseudostack.
@@ -149,27 +190,37 @@ opus_int silk_encode_frame_FIX(
         /*****************************************/
         /* Find pitch lags, initial LPC analysis */
         /*****************************************/
+        OPUS_BENCH_PROFILE_START();
         silk_find_pitch_lags_FIX( psEnc, &sEncCtrl, res_pitch, x_frame - psEnc->sCmn.ltp_mem_length, psEnc->sCmn.arch );
+        OPUS_BENCH_PROFILE_END(OPUS_BENCH_STAGE_PITCH);
 
         /************************/
         /* Noise shape analysis */
         /************************/
+        OPUS_BENCH_PROFILE_START();
         silk_noise_shape_analysis_FIX( psEnc, &sEncCtrl, res_pitch_frame, x_frame, psEnc->sCmn.arch );
+        OPUS_BENCH_PROFILE_END(OPUS_BENCH_STAGE_NOISE_SHAPE);
 
         /***************************************************/
         /* Find linear prediction coefficients (LPC + LTP) */
         /***************************************************/
+        OPUS_BENCH_PROFILE_START();
         silk_find_pred_coefs_FIX( psEnc, &sEncCtrl, res_pitch_frame, x_frame, condCoding );
+        OPUS_BENCH_PROFILE_END(OPUS_BENCH_STAGE_PREDICTORS);
 
         /****************************************/
         /* Process gains                        */
         /****************************************/
+        OPUS_BENCH_PROFILE_START();
         silk_process_gains_FIX( psEnc, &sEncCtrl, condCoding );
+        OPUS_BENCH_PROFILE_END(OPUS_BENCH_STAGE_GAINS);
 
         /****************************************/
         /* Low Bitrate Redundant Encoding       */
         /****************************************/
+        OPUS_BENCH_PROFILE_START();
         silk_LBRR_encode_FIX( psEnc, &sEncCtrl, x_frame, condCoding );
+        OPUS_BENCH_PROFILE_END(OPUS_BENCH_STAGE_LBRR);
 
         /* Loop over quantizer and entropy coding to control bitrate */
         maxIter = 6;
@@ -205,15 +256,19 @@ opus_int silk_encode_frame_FIX(
                 /* Noise shaping quantization            */
                 /*****************************************/
                 if( psEnc->sCmn.nStatesDelayedDecision > 1 || psEnc->sCmn.warping_Q16 > 0 ) {
+                    OPUS_BENCH_PROFILE_START();
                     silk_NSQ_del_dec( &psEnc->sCmn, &psEnc->sCmn.sNSQ, &psEnc->sCmn.indices, x_frame, psEnc->sCmn.pulses,
                            sEncCtrl.PredCoef_Q12[ 0 ], sEncCtrl.LTPCoef_Q14, sEncCtrl.AR_Q13, sEncCtrl.HarmShapeGain_Q14,
                            sEncCtrl.Tilt_Q14, sEncCtrl.LF_shp_Q14, sEncCtrl.Gains_Q16, sEncCtrl.pitchL, sEncCtrl.Lambda_Q10, sEncCtrl.LTP_scale_Q14,
                            psEnc->sCmn.arch );
+                    OPUS_BENCH_PROFILE_END(OPUS_BENCH_STAGE_NSQ);
                 } else {
+                    OPUS_BENCH_PROFILE_START();
                     silk_NSQ( &psEnc->sCmn, &psEnc->sCmn.sNSQ, &psEnc->sCmn.indices, x_frame, psEnc->sCmn.pulses,
                             sEncCtrl.PredCoef_Q12[ 0 ], sEncCtrl.LTPCoef_Q14, sEncCtrl.AR_Q13, sEncCtrl.HarmShapeGain_Q14,
                             sEncCtrl.Tilt_Q14, sEncCtrl.LF_shp_Q14, sEncCtrl.Gains_Q16, sEncCtrl.pitchL, sEncCtrl.Lambda_Q10, sEncCtrl.LTP_scale_Q14,
                             psEnc->sCmn.arch);
+                    OPUS_BENCH_PROFILE_END(OPUS_BENCH_STAGE_NSQ);
                 }
 
                 if ( iter == maxIter && !found_lower ) {
@@ -223,6 +278,7 @@ opus_int silk_encode_frame_FIX(
                 /****************************************/
                 /* Encode Parameters                    */
                 /****************************************/
+                OPUS_BENCH_PROFILE_START();
                 silk_encode_indices( &psEnc->sCmn, psRangeEnc, psEnc->sCmn.nFramesEncoded, 0, condCoding );
 
                 /****************************************/
@@ -230,6 +286,7 @@ opus_int silk_encode_frame_FIX(
                 /****************************************/
                 silk_encode_pulses( psRangeEnc, psEnc->sCmn.indices.signalType, psEnc->sCmn.indices.quantOffsetType,
                     psEnc->sCmn.pulses, psEnc->sCmn.frame_length );
+                OPUS_BENCH_PROFILE_END(OPUS_BENCH_STAGE_ENTROPY);
 
                 nBits = ec_tell( psRangeEnc );
 
@@ -369,6 +426,9 @@ opus_int silk_encode_frame_FIX(
     if( psEnc->sCmn.prefillFlag ) {
         /* No payload */
         *pnBytesOut = 0;
+#ifdef OPUS_BENCH_STAGE_PROFILE
+        opus_bench_profile_record(OPUS_BENCH_STAGE_FRAME_TOTAL, opus_bench_frame_start);
+#endif
         RESTORE_STACK;
         return ret;
     }
@@ -384,6 +444,9 @@ opus_int silk_encode_frame_FIX(
     /* Payload size */
     *pnBytesOut = silk_RSHIFT( ec_tell( psRangeEnc ) + 7, 3 );
 
+#ifdef OPUS_BENCH_STAGE_PROFILE
+    opus_bench_profile_record(OPUS_BENCH_STAGE_FRAME_TOTAL, opus_bench_frame_start);
+#endif
     RESTORE_STACK;
     return ret;
 }

@@ -29,11 +29,16 @@
 #include "config.h"
 #endif
 
+#ifdef OPUS_BENCH_STAGE_PROFILE
+#include "opus_bench_profile.h"
+#endif
+
 #define ANALYSIS_C
 
 #ifdef MLP_TRAINING
 #include <stdio.h>
 #endif
+#include <math.h>
 
 #include "mathops.h"
 #include "kiss_fft.h"
@@ -487,7 +492,15 @@ static void tonality_analysis(TonalityAnalysisState *tonal, const CELTMode *celt
     float below_max_pitch;
     float above_max_pitch;
     int is_silence;
+#ifdef OPUS_BENCH_STAGE_PROFILE
+    uint32_t profile_section_start;
+    uint32_t profile_function_start;
+    uint32_t profile_post_phase_start;
+#endif
     SAVE_STACK;
+#ifdef OPUS_BENCH_STAGE_PROFILE
+    profile_function_start = opus_bench_profile_now();
+#endif
 
     if (!tonal->initialized)
     {
@@ -556,7 +569,15 @@ static void tonality_analysis(TonalityAnalysisState *tonal, const CELTMode *celt
        RESTORE_STACK;
        return;
     }
+#ifdef OPUS_BENCH_STAGE_PROFILE
+    opus_bench_profile_record(OPUS_BENCH_STAGE_TONALITY_INPUT, profile_function_start);
+    profile_section_start = opus_bench_profile_now();
+#endif
     opus_fft(kfft, in, out, tonal->arch);
+#ifdef OPUS_BENCH_STAGE_PROFILE
+    opus_bench_profile_record(OPUS_BENCH_STAGE_TONALITY_FFT, profile_section_start);
+    profile_section_start = opus_bench_profile_now();
+#endif
 #ifndef FIXED_POINT
     /* If there's any NaN on the input, the entire output will be NaN, so we only need to check one value. */
     if (celt_isnan(out[0].r))
@@ -611,6 +632,11 @@ static void tonality_analysis(TonalityAnalysisState *tonal, const CELTMode *celt
        float tt = MIN32(tonality2[i], MAX32(tonality2[i-1], tonality2[i+1]));
        tonality[i] = .9f*MAX32(tonality[i], tt-.1f);
     }
+#ifdef OPUS_BENCH_STAGE_PROFILE
+    opus_bench_profile_record(OPUS_BENCH_STAGE_TONALITY_PHASE, profile_section_start);
+    profile_post_phase_start = opus_bench_profile_now();
+    profile_section_start = profile_post_phase_start;
+#endif
     frame_tonality = 0;
     max_frame_tonality = 0;
     /*tw_sum = 0;*/
@@ -641,7 +667,7 @@ static void tonality_analysis(TonalityAnalysisState *tonal, const CELTMode *celt
           E += binE;
        }
        E = SCALE_ENER(E);
-       band_log2[0] = .5f*1.442695f*(float)log(E+1e-10f);
+       band_log2[0] = .5f*1.442695f*logf(E+1e-10f);
     }
     for (b=0;b<NB_TBANDS;b++)
     {
@@ -670,9 +696,9 @@ static void tonality_analysis(TonalityAnalysisState *tonal, const CELTMode *celt
        tonal->E[tonal->E_count][b] = E;
        frame_noisiness += nE/(1e-15f+E);
 
-       frame_loudness += (float)sqrt(E+1e-10f);
-       logE[b] = (float)log(E+1e-10f);
-       band_log2[b+1] = .5f*1.442695f*(float)log(E+1e-10f);
+       frame_loudness += sqrtf(E+1e-10f);
+       logE[b] = logf(E+1e-10f);
+       band_log2[b+1] = .5f*1.442695f*logf(E+1e-10f);
        tonal->logE[tonal->E_count][b] = logE[b];
        if (tonal->count==0)
           tonal->highE[b] = tonal->lowE[b] = logE[b];
@@ -697,11 +723,11 @@ static void tonality_analysis(TonalityAnalysisState *tonal, const CELTMode *celt
        L1=L2=0;
        for (i=0;i<NB_FRAMES;i++)
        {
-          L1 += (float)sqrt(tonal->E[i][b]);
+          L1 += sqrtf(tonal->E[i][b]);
           L2 += tonal->E[i][b];
        }
 
-       stationarity = MIN16(0.99f,L1/(float)sqrt(1e-15+NB_FRAMES*L2));
+       stationarity = MIN16(0.99f,L1/sqrtf(1e-15f+NB_FRAMES*L2));
        stationarity *= stationarity;
        stationarity *= stationarity;
        frame_stationarity += stationarity;
@@ -724,6 +750,10 @@ static void tonality_analysis(TonalityAnalysisState *tonal, const CELTMode *celt
        tonal->prev_band_tonality[b] = band_tonality[b];
     }
 
+#ifdef OPUS_BENCH_STAGE_PROFILE
+    opus_bench_profile_record(OPUS_BENCH_STAGE_TONALITY_BAND_STATS, profile_section_start);
+    profile_section_start = opus_bench_profile_now();
+#endif
     leakage_from[0] = band_log2[0];
     leakage_to[0] = band_log2[0] - LEAKAGE_OFFSET;
     for (b=1;b<NB_TBANDS+1;b++)
@@ -753,6 +783,10 @@ static void tonality_analysis(TonalityAnalysisState *tonal, const CELTMode *celt
     }
     for (;b<LEAK_BANDS;b++) info->leak_boost[b] = 0;
 
+#ifdef OPUS_BENCH_STAGE_PROFILE
+    opus_bench_profile_record(OPUS_BENCH_STAGE_TONALITY_LEAKAGE, profile_section_start);
+    profile_section_start = opus_bench_profile_now();
+#endif
     for (i=0;i<NB_FRAMES;i++)
     {
        int j;
@@ -772,7 +806,11 @@ static void tonality_analysis(TonalityAnalysisState *tonal, const CELTMode *celt
        }
        spec_variability += mindist;
     }
-    spec_variability = (float)sqrt(spec_variability/NB_FRAMES/NB_TBANDS);
+    spec_variability = sqrtf(spec_variability/NB_FRAMES/NB_TBANDS);
+#ifdef OPUS_BENCH_STAGE_PROFILE
+    opus_bench_profile_record(OPUS_BENCH_STAGE_TONALITY_VARIABILITY, profile_section_start);
+    profile_section_start = opus_bench_profile_now();
+#endif
     bandwidth_mask = 0;
     bandwidth = 0;
     maxE = 0;
@@ -851,7 +889,11 @@ static void tonality_analysis(TonalityAnalysisState *tonal, const CELTMode *celt
        bandwidth--;
     if (tonal->count<=2)
        bandwidth = 20;
-    frame_loudness = 20*(float)log10(frame_loudness);
+#ifdef OPUS_BENCH_STAGE_PROFILE
+    opus_bench_profile_record(OPUS_BENCH_STAGE_TONALITY_BANDWIDTH, profile_section_start);
+    profile_section_start = opus_bench_profile_now();
+#endif
+    frame_loudness = 20*log10f(frame_loudness);
     tonal->Etracker = MAX32(tonal->Etracker-.003f, frame_loudness);
     tonal->lowECount *= (1-alphaE);
     if (frame_loudness < tonal->Etracker-30)
@@ -920,7 +962,7 @@ static void tonality_analysis(TonalityAnalysisState *tonal, const CELTMode *celt
        tonal->mem[i] = BFCC[i];
     }
     for (i=0;i<9;i++)
-       features[11+i] = (float)sqrt(tonal->std[i]) - std_feature_bias[i];
+       features[11+i] = sqrtf(tonal->std[i]) - std_feature_bias[i];
     features[18] = spec_variability - 0.78f;
     features[20] = info->tonality - 0.154723f;
     features[21] = info->activity - 0.724643f;
@@ -928,9 +970,17 @@ static void tonality_analysis(TonalityAnalysisState *tonal, const CELTMode *celt
     features[23] = info->tonality_slope + 0.069216f;
     features[24] = tonal->lowECount - 0.067930f;
 
+#ifdef OPUS_BENCH_STAGE_PROFILE
+    opus_bench_profile_record(OPUS_BENCH_STAGE_TONALITY_DCT, profile_section_start);
+    opus_bench_profile_record(OPUS_BENCH_STAGE_TONALITY_POST_PHASE, profile_post_phase_start);
+    profile_section_start = opus_bench_profile_now();
+#endif
     analysis_compute_dense(&layer0, layer_out, features);
     analysis_compute_gru(&layer1, tonal->rnn_state, layer_out);
     analysis_compute_dense(&layer2, frame_probs, tonal->rnn_state);
+#ifdef OPUS_BENCH_STAGE_PROFILE
+    opus_bench_profile_record(OPUS_BENCH_STAGE_TONALITY_MODEL, profile_section_start);
+#endif
 
     /* Probability of speech or music vs noise */
     info->activity_probability = frame_probs[1];
@@ -967,7 +1017,13 @@ void run_analysis(TonalityAnalysisState *analysis, const CELTMode *celt_mode, co
       pcm_len = analysis_frame_size - analysis->analysis_offset;
       offset = analysis->analysis_offset;
       while (pcm_len>0) {
+#ifdef OPUS_BENCH_STAGE_PROFILE
+         uint32_t profile_start = opus_bench_profile_now();
+#endif
          tonality_analysis(analysis, celt_mode, analysis_pcm, IMIN(Fs/50, pcm_len), offset, c1, c2, C, lsb_depth, downmix);
+#ifdef OPUS_BENCH_STAGE_PROFILE
+         opus_bench_profile_record(OPUS_BENCH_STAGE_TONALITY_FRAME, profile_start);
+#endif
          offset += Fs/50;
          pcm_len -= Fs/50;
       }
@@ -976,7 +1032,15 @@ void run_analysis(TonalityAnalysisState *analysis, const CELTMode *celt_mode, co
       analysis->analysis_offset -= frame_size;
    }
 
+#ifdef OPUS_BENCH_STAGE_PROFILE
+   {
+      uint32_t profile_start = opus_bench_profile_now();
+      tonality_get_info(analysis, analysis_info, frame_size);
+      opus_bench_profile_record(OPUS_BENCH_STAGE_TONALITY_INFO, profile_start);
+   }
+#else
    tonality_get_info(analysis, analysis_info, frame_size);
+#endif
 }
 
 #endif /* DISABLE_FLOAT_API */
