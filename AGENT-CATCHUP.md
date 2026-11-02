@@ -1,7 +1,7 @@
 # Agent Catch-Up: ESP32 Opus Benchmarking Project
 
 > Read this first. It summarizes everything done so far, what is verified vs. assumed,
-> and what to do next. Last updated: 2026-10-25.
+> and what to do next. Last updated: 2026-11-1.
 > This file is machine-agnostic: it is meant for every contributor, on any OS.
 
 ## 1. Goal
@@ -42,8 +42,9 @@ and avoid assuming prior knowledge.
 |---|---|
 | `base_benchmark_main.c` | Stand-in harness: 440 Hz tone, int16 autocorrelation kernel (80 lags x 320 samples = 25,600 MACs), cycle timing with `esp_cpu_get_cycle_count()`. Original version printed CPU MHz from a compile-time macro (`CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ`); suggested switching to `esp_rom_get_cpu_ticks_per_us()`. Superseded by the Opus benchmark. |
 | `opus_benchmark_main.c` | **Current main.** Runs `opus_encode()` on a synthetic speech-like signal (30-harmonic wobbling-pitch tone + envelope + deterministic noise). 16 kHz mono, 20 ms frames (320 samples), 50 frames per pass, 1 untimed warm-up pass + 5 timed passes, `OPUS_APPLICATION_VOIP`, `OPUS_SIGNAL_VOICE`, 20 kbps, VBR on, complexity 0. Runs in its own task pinned to core 1 (stack currently 16 KB). Prints min/avg/max cycles, time, CPU load, mode counts (SILK/hybrid/CELT from the TOC byte), bytes/frame, **FNV-1a hash of all output bytes**, determinism check, encoder size, heap and stack stats. Runs once per reset. |
+| `adpcm_benchmark_main.c` | **Second codec for comparison, not yet made active (see below).** Hand-written IMA/DVI4 ADPCM encoder (no external library — just the standard 1992 IMA step/index tables), no SIMD or Xtensa asm tricks applied. Uses the **same** test-signal generator, frame size, pass structure (1 warm-up + 5 timed passes of 50 frames), FNV-1a output hash, and determinism check as the Opus benchmark, so the two are directly comparable. Fixed-rate: always 4 bits/sample -> exactly 160 bytes/frame (4x compression, 64,000 bps), no complexity/bitrate knobs, encoder state is 2 bytes (no heap allocation). Runs in its own task pinned to core 1 (stack 8 KB). Not yet built/flashed/measured — no benchmark numbers exist for it yet. |
 
-`main/CMakeLists.txt` must list the active source (`idf_component_register(SRCS "opus_benchmark_main.c" INCLUDE_DIRS ".")`).
+`main/CMakeLists.txt` lists the active source (`idf_component_register(SRCS "opus_benchmark_main.c" INCLUDE_DIRS ".")`). Only one `app_main` can be linked at a time, so to benchmark ADPCM instead, change that `SRCS` line to `"adpcm_benchmark_main.c"`, then **ESP-IDF: Full Clean** and rebuild/flash.
 
 ## 5. Opus component and the IRAM bug (important)
 
@@ -86,6 +87,10 @@ Notes:
 - Min-to-max spread (about 43%) is far larger than the toy kernel's and the output is deterministic, so it is **content-dependent work, not noise** (hypothesis, not yet verified; per-frame logging would confirm).
 - The hash is valid **only for this exact config** (bitrate, complexity, signal, sample rate, fixed-point build). Re-baseline when any of those change. Compiler flags/optimizations should NOT change it (integer math); a changed hash after an optimization means the bitstream changed (bug).
 - Baseline already includes micro-opus's Xtensa DSP optimizations.
+
+### ADPCM encoder (`adpcm_benchmark_main.c`)
+
+Not yet built/flashed on hardware — no cycle counts, hash, or memory numbers exist yet. Once measured (same -O2, 240 MHz convention), add a results row here in the same format as the Opus table above. Expect much lower cycles/frame than Opus (no transform, no entropy coder, just a per-sample predictor update) and a worse compression ratio (fixed 4x vs. Opus's ~14x) — useful contrast for the report.
 
 ## 7. Hardware facts relevant to optimization
 

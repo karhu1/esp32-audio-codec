@@ -74,3 +74,28 @@ Task stack          : 16384 bytes allocated, 12940 bytes never used
 
 Done. Press EN to run again.
 ```
+
+### ADPCM benchmarking
+ADPCM (IMA/DVI4) benchmark starting...
+Generating test signal...
+Encoding: pass -1 is an untimed warm-up, then 5 timed passes of 50 frames...
+
+===== ADPCM (IMA/DVI4) encode benchmark =====
+CPU clock           : 240 MHz
+Format              : 16000 Hz mono, 20 ms frames (320 samples)
+Settings            : 4 bits/sample, fixed-rate (no VBR, no complexity knob)
+Frames timed        : 250 (5 passes x 50 frames)
+Cycles/frame        : min 18988  avg 19005  max 19025 (worst = frame 25)
+Time/frame          : avg 79.2 us  max 79.3 us  (budget 20000 us)
+CPU load (1 core)   : avg 0.4 %  worst-case 0.4 %
+Real-time (average) : YES
+Real-time (worst)   : YES
+Output              : 160 bytes/frame (fixed), 64000 bps, 4x compression vs 16-bit PCM
+Output hash (FNV-1a): 0xB843FABC   (must not change after optimizing)
+Deterministic       : YES (all passes identical)
+Encoder state size  : 4 bytes (sizeof adpcm_state_t)
+Heap used by create : 0 bytes (no dynamic allocation needed)
+Heap free / min     : 267440 / 263232 bytes
+Task stack          : 8192 bytes allocated, 7148 bytes never used
+
+Done. Press EN to run again.
