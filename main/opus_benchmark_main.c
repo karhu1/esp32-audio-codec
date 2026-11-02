@@ -1,15 +1,19 @@
 /*
- * ESP32 Opus encoder benchmark
- * ----------------------------
- * Encodes a deterministic, speech-like test signal with libopus and reports
- * CPU cycles per 20 ms frame, memory use, which Opus mode was chosen, and a
- * hash of the encoded output.
+ * ESP32 Opus encoder benchmark, v2: complexity sweep + per-frame log
+ * ------------------------------------------------------------------
+ * Encodes a deterministic, speech-like test signal with libopus at several
+ * complexity levels and reports, for each one:
+ *   - CPU cycles per 20 ms frame (min / avg / max) and the real-time check
+ *   - bytes per frame and effective bitrate
+ *   - which Opus modes were used (SILK / hybrid / CELT)
+ *   - an FNV-1a hash of the encoded bytes (the correctness reference)
  *
- * The output hash is your correctness check: after you optimize anything,
- * the hash must stay the same as the baseline (the encoder is deterministic,
- * so any change means your optimization altered the bitstream).
+ * It also prints, for one chosen complexity, the average cycles and the packet
+ * size of every frame, so you can see WHY the cost varies from frame to frame.
  *
- * Runs once per reset. Press EN to run it again.
+ * Complexity 0 uses exactly the same settings as the v1 baseline, so its hash
+ * should still equal 0x317FC6D7 on an unmodified build. Runs once per reset
+ * (press EN to run again).
  */
 
 #include <stdio.h>
@@ -18,6 +22,7 @@
 #include <stdbool.h>
 #include <math.h>
 
+#include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_cpu.h"        // esp_cpu_get_cycle_count()
@@ -33,20 +38,47 @@
 #define NUM_PASSES            5       // timed passes (after 1 untimed warm-up pass)
 
 #define BENCH_BITRATE         20000   // bits per second
-#define BENCH_COMPLEXITY      0       // 0 (fastest) to 10 (best quality)
 
-// Opus can need a lot of stack when it is not built with its pseudostack
-// option, so the encoder runs in its own task with a big stack instead of
-// the small default main task. If you see "Stack canary watchpoint triggered
-// (opus_bench)", raise this.
-#define BENCH_TASK_STACK_BYTES  (16 * 1024)
+// Complexity levels to sweep (0 = fastest, 10 = best quality).
+static const int k_complexities[] = {0, 2, 5, 10};
+#define NUM_COMPLEXITIES      ((int)(sizeof(k_complexities) / sizeof(k_complexities[0])))
+
+// Print the per-frame table for this complexity (set to -1 to disable).
+#define PER_FRAME_LOG_COMPLEXITY   0
+
+// Hash produced by the v1 baseline at complexity 0 (unmodified micro-opus build).
+#define BASELINE_HASH_C0      0x317FC6D7u
+
+// Task stack. Higher complexity may use more stack than complexity 0 did, so this
+// is larger than the 16 KB v1 used. The result block prints how much was never used.
+#define BENCH_TASK_STACK_BYTES  (24 * 1024)
 
 #define NUM_HARMONICS         30
 #define TWO_PI_F              6.28318530718f
 
 // ---- Buffers (static, so they live in internal RAM, not on a stack) --------
-static int16_t g_pcm[NUM_FRAMES * FRAME_SAMPLES];
-static uint8_t g_pkt[1276];   // 1276 bytes is the largest possible Opus packet
+static int16_t  g_pcm[NUM_FRAMES * FRAME_SAMPLES];
+static uint8_t  g_pkt[1276];                 // 1276 bytes is the largest possible Opus packet
+
+// Per-frame statistics (reused for every complexity level).
+static uint32_t g_frame_cycle_sum[NUM_FRAMES];   // summed over the timed passes
+static uint16_t g_frame_bytes[NUM_FRAMES];       // packet size (identical every pass)
+static uint8_t  g_frame_config[NUM_FRAMES];      // Opus TOC config number (mode/bandwidth)
+
+typedef struct {
+    int      complexity;
+    bool     ok;
+    uint32_t min_cycles, avg_cycles, max_cycles;
+    uint32_t worst_frame;
+    uint32_t timed_frames, total_bytes;
+    uint32_t silk, hybrid, celt;
+    uint32_t hash;
+    bool     deterministic;
+    int      enc_size;
+    size_t   heap_used;
+} result_t;
+
+static result_t g_res[NUM_COMPLEXITIES];
 
 // ---- Test signal -----------------------------------------------------------
 // A "voiced speech" stand-in: a wobbling-pitch harmonic series with a slow
@@ -85,45 +117,50 @@ static uint32_t fnv1a(uint32_t h, const uint8_t *d, int n)
     return h;
 }
 
-// ---- Benchmark task --------------------------------------------------------
-static void bench_task(void *arg)
+// Which compiler optimization level this firmware was built with (recorded next
+// to every measurement so results stay interpretable).
+static const char *opt_level_name(void)
 {
-    (void)arg;
+#if defined(CONFIG_COMPILER_OPTIMIZATION_DEBUG)
+    return "-Og (debug)";
+#elif defined(CONFIG_COMPILER_OPTIMIZATION_PERF)
+    return "-O2 (performance)";
+#elif defined(CONFIG_COMPILER_OPTIMIZATION_SIZE)
+    return "-Os (size)";
+#elif defined(CONFIG_COMPILER_OPTIMIZATION_NONE)
+    return "-O0 (none)";
+#else
+    return "unknown (check menuconfig)";
+#endif
+}
 
-    const uint32_t cpu_mhz = esp_rom_get_cpu_ticks_per_us();   // real clock, read at run time
-
-    uint32_t min_cycles = UINT32_MAX, max_cycles = 0;
+// ---- One complexity level --------------------------------------------------
+static void run_config(int complexity, result_t *r)
+{
+    *r = (result_t){ .complexity = complexity, .ok = true, .min_cycles = UINT32_MAX,
+                     .deterministic = true };
     uint64_t sum_cycles = 0;
-    uint32_t timed_frames = 0, worst_frame = 0;
-    uint32_t total_bytes = 0;
-    uint32_t silk_frames = 0, hybrid_frames = 0, celt_frames = 0;
     uint32_t ref_hash = 0;
-    bool deterministic = true;
-    bool ok = true;
 
-    printf("\nOpus benchmark starting (libopus %s)...\n", opus_get_version_string());
-    printf("Generating test signal...\n");
-    generate_test_signal(g_pcm, NUM_FRAMES * FRAME_SAMPLES);
+    for (int f = 0; f < NUM_FRAMES; f++) g_frame_cycle_sum[f] = 0;
 
     size_t heap_before = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     int err = 0;
     OpusEncoder *enc = opus_encoder_create(SAMPLE_RATE_HZ, 1, OPUS_APPLICATION_VOIP, &err);
     if (err != OPUS_OK || enc == NULL) {
-        printf("opus_encoder_create failed: %s\n", opus_strerror(err));
-        vTaskDelete(NULL);
+        printf("opus_encoder_create failed (complexity %d): %s\n", complexity, opus_strerror(err));
+        r->ok = false;
         return;
     }
-    size_t heap_after = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    r->heap_used = heap_before - heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    r->enc_size  = opus_encoder_get_size(1);
 
     opus_encoder_ctl(enc, OPUS_SET_BITRATE(BENCH_BITRATE));
-    opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(BENCH_COMPLEXITY));
+    opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(complexity));
     opus_encoder_ctl(enc, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
     opus_encoder_ctl(enc, OPUS_SET_VBR(1));
 
-    printf("Encoding: pass -1 is an untimed warm-up, then %d timed passes of %d frames...\n",
-           NUM_PASSES, NUM_FRAMES);
-
-    for (int pass = -1; pass < NUM_PASSES && ok; pass++) {
+    for (int pass = -1; pass < NUM_PASSES && r->ok; pass++) {
         opus_encoder_ctl(enc, OPUS_RESET_STATE);   // every pass starts from the same state
         uint32_t hash = 2166136261u;
 
@@ -135,8 +172,8 @@ static void bench_task(void *arg)
             uint32_t t1 = esp_cpu_get_cycle_count();
 
             if (n < 0) {
-                printf("opus_encode failed: %s\n", opus_strerror(n));
-                ok = false;
+                printf("opus_encode failed (complexity %d): %s\n", complexity, opus_strerror(n));
+                r->ok = false;
                 break;
             }
 
@@ -144,68 +181,113 @@ static void bench_task(void *arg)
 
             if (pass >= 0) {
                 uint32_t cycles = t1 - t0;          // unsigned math handles counter wraparound
-                if (cycles < min_cycles) min_cycles = cycles;
-                if (cycles > max_cycles) { max_cycles = cycles; worst_frame = (uint32_t)f; }
+                if (cycles < r->min_cycles) r->min_cycles = cycles;
+                if (cycles > r->max_cycles) { r->max_cycles = cycles; r->worst_frame = (uint32_t)f; }
                 sum_cycles += cycles;
-                timed_frames++;
-                total_bytes += (uint32_t)n;
+                g_frame_cycle_sum[f] += cycles;
+                r->timed_frames++;
+                r->total_bytes += (uint32_t)n;
 
                 int config = g_pkt[0] >> 3;         // Opus TOC byte: 0-11 SILK, 12-15 hybrid, 16-31 CELT
-                if (config < 12)      silk_frames++;
-                else if (config < 16) hybrid_frames++;
-                else                  celt_frames++;
+                if (config < 12)      r->silk++;
+                else if (config < 16) r->hybrid++;
+                else                  r->celt++;
+
+                g_frame_bytes[f]  = (uint16_t)n;
+                g_frame_config[f] = (uint8_t)config;
             }
 
-            // Feed the watchdog and let other tasks run, outside the timed region.
+            // Let other tasks (and the watchdog) run, outside the timed region.
             if ((f % 10) == 9) vTaskDelay(1);
         }
 
-        if (pass == -1) {
-            ref_hash = hash;
-        } else if (hash != ref_hash) {
-            deterministic = false;
-        }
+        if (pass == -1)          ref_hash = hash;
+        else if (hash != ref_hash) r->deterministic = false;
     }
 
-    if (ok && timed_frames > 0) {
-        uint32_t avg_cycles = (uint32_t)(sum_cycles / timed_frames);
-        float avg_us    = (float)avg_cycles / (float)cpu_mhz;
-        float max_us    = (float)max_cycles / (float)cpu_mhz;
-        float budget_us = (float)(FRAME_MS * 1000);
-        float bitrate   = (float)total_bytes * 8.0f / ((float)timed_frames * (FRAME_MS / 1000.0f));
-
-        printf("\n===== Opus encode benchmark =====\n");
-        printf("CPU clock           : %u MHz\n", (unsigned)cpu_mhz);
-        printf("Format              : %d Hz mono, %d ms frames (%d samples)\n",
-               SAMPLE_RATE_HZ, FRAME_MS, FRAME_SAMPLES);
-        printf("Settings            : target %d bps, complexity %d, VBR on, VOIP/voice\n",
-               BENCH_BITRATE, BENCH_COMPLEXITY);
-        printf("Frames timed        : %u (%d passes x %d frames)\n",
-               (unsigned)timed_frames, NUM_PASSES, NUM_FRAMES);
-        printf("Cycles/frame        : min %" PRIu32 "  avg %" PRIu32 "  max %" PRIu32 " (worst = frame %u)\n",
-               min_cycles, avg_cycles, max_cycles, (unsigned)worst_frame);
-        printf("Time/frame          : avg %.1f us  max %.1f us  (budget %.0f us)\n",
-               avg_us, max_us, budget_us);
-        printf("CPU load (1 core)   : avg %.1f %%  worst-case %.1f %%\n",
-               100.0f * avg_us / budget_us, 100.0f * max_us / budget_us);
-        printf("Real-time (average) : %s\n", avg_us < budget_us ? "YES" : "NO");
-        printf("Real-time (worst)   : %s\n", max_us < budget_us ? "YES" : "NO");
-        printf("Opus modes used     : SILK %u, hybrid %u, CELT %u frames\n",
-               (unsigned)silk_frames, (unsigned)hybrid_frames, (unsigned)celt_frames);
-        printf("Output              : %.1f bytes/frame avg, effective %.0f bps\n",
-               (float)total_bytes / (float)timed_frames, bitrate);
-        printf("Output hash (FNV-1a): 0x%08" PRIX32 "   (must not change after optimizing)\n", ref_hash);
-        printf("Deterministic       : %s\n", deterministic ? "YES (all passes identical)" : "NO - investigate!");
-        printf("Encoder state size  : %d bytes (opus_encoder_get_size)\n", opus_encoder_get_size(1));
-        printf("Heap used by create : %u bytes\n", (unsigned)(heap_before - heap_after));
-        printf("Heap free / min     : %u / %u bytes\n",
-               (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
-               (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT));
-        printf("Task stack          : %u bytes allocated, %u bytes never used\n",
-               (unsigned)BENCH_TASK_STACK_BYTES, (unsigned)uxTaskGetStackHighWaterMark(NULL));
-    }
+    r->hash = ref_hash;
+    if (r->timed_frames > 0) r->avg_cycles = (uint32_t)(sum_cycles / r->timed_frames);
 
     opus_encoder_destroy(enc);
+}
+
+static void print_per_frame(int complexity, const uint32_t cpu_mhz)
+{
+    printf("\n--- Per-frame detail, complexity %d (cycles averaged over %d passes) ---\n",
+           complexity, NUM_PASSES);
+    printf("frame, avg_cycles, avg_us, bytes, toc_config\n");
+    for (int f = 0; f < NUM_FRAMES; f++) {
+        uint32_t avg = g_frame_cycle_sum[f] / NUM_PASSES;
+        printf("%d, %" PRIu32 ", %.1f, %u, %u\n", f, avg,
+               (float)avg / (float)cpu_mhz, (unsigned)g_frame_bytes[f], (unsigned)g_frame_config[f]);
+    }
+}
+
+// ---- Benchmark task --------------------------------------------------------
+static void bench_task(void *arg)
+{
+    (void)arg;
+    const uint32_t cpu_mhz = esp_rom_get_cpu_ticks_per_us();   // real clock, read at run time
+    const float budget_us  = (float)(FRAME_MS * 1000);
+
+    printf("\nOpus benchmark v2 starting (libopus %s)...\n", opus_get_version_string());
+    printf("Generating test signal...\n");
+    generate_test_signal(g_pcm, NUM_FRAMES * FRAME_SAMPLES);
+
+    printf("Sweeping complexity levels; each runs 1 warm-up pass + %d timed passes of %d frames.\n",
+           NUM_PASSES, NUM_FRAMES);
+
+    for (int i = 0; i < NUM_COMPLEXITIES; i++) {
+        printf("  complexity %d ...\n", k_complexities[i]);
+        run_config(k_complexities[i], &g_res[i]);
+        if (!g_res[i].ok) break;
+        if (k_complexities[i] == PER_FRAME_LOG_COMPLEXITY) print_per_frame(k_complexities[i], cpu_mhz);
+    }
+
+    printf("\n===== Opus encode benchmark: complexity sweep =====\n");
+    printf("CPU clock           : %u MHz\n", (unsigned)cpu_mhz);
+    printf("Compiler opt level  : %s\n", opt_level_name());
+    printf("Format              : %d Hz mono, %d ms frames (%d samples)\n",
+           SAMPLE_RATE_HZ, FRAME_MS, FRAME_SAMPLES);
+    printf("Settings            : target %d bps, VBR on, VOIP/voice\n", BENCH_BITRATE);
+    printf("Frames per level    : %d timed (%d passes x %d frames)\n",
+           NUM_PASSES * NUM_FRAMES, NUM_PASSES, NUM_FRAMES);
+    printf("Real-time budget    : %.0f us per frame\n\n", budget_us);
+
+    printf("cplx | min cycles |  avg cycles | max cycles | avg us | max us | load avg/worst %% | RT | B/frame |  bps  | modes S/H/C | hash       | det\n");
+    for (int i = 0; i < NUM_COMPLEXITIES; i++) {
+        const result_t *r = &g_res[i];
+        if (!r->ok || r->timed_frames == 0) {
+            printf("%4d | (failed)\n", r->complexity);
+            continue;
+        }
+        float avg_us = (float)r->avg_cycles / (float)cpu_mhz;
+        float max_us = (float)r->max_cycles / (float)cpu_mhz;
+        float bpf    = (float)r->total_bytes / (float)r->timed_frames;
+        float bps    = bpf * 8.0f / (FRAME_MS / 1000.0f);
+        printf("%4d | %10" PRIu32 " | %11" PRIu32 " | %10" PRIu32 " | %6.0f | %6.0f | %6.1f / %-6.1f | %-2s | %7.1f | %5.0f | %u/%u/%u | 0x%08" PRIX32 " | %s\n",
+               r->complexity, r->min_cycles, r->avg_cycles, r->max_cycles,
+               avg_us, max_us, 100.0f * avg_us / budget_us, 100.0f * max_us / budget_us,
+               (max_us < budget_us) ? "OK" : (avg_us < budget_us ? "avg" : "NO"),
+               bpf, bps, (unsigned)r->silk, (unsigned)r->hybrid, (unsigned)r->celt,
+               r->hash, r->deterministic ? "yes" : "NO");
+    }
+    printf("(RT: OK = even the slowest frame fits the budget; avg = only the average fits; NO = too slow)\n");
+
+    if (g_res[0].ok && g_res[0].complexity == 0) {
+        printf("\nBaseline check (complexity 0): hash 0x%08" PRIX32 " vs v1 baseline 0x%08X -> %s\n",
+               g_res[0].hash, (unsigned)BASELINE_HASH_C0,
+               g_res[0].hash == BASELINE_HASH_C0 ? "MATCH" : "DIFFERENT (expected only if you changed the encoder, build or settings)");
+    }
+
+    printf("\nEncoder state size  : %d bytes (opus_encoder_get_size)\n", g_res[0].enc_size);
+    printf("Heap used by create : %u bytes\n", (unsigned)g_res[0].heap_used);
+    printf("Heap free / min     : %u / %u bytes\n",
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+           (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT));
+    printf("Task stack          : %u bytes allocated, %u bytes never used\n",
+           (unsigned)BENCH_TASK_STACK_BYTES, (unsigned)uxTaskGetStackHighWaterMark(NULL));
+
     printf("\nDone. Press EN to run again.\n");
     vTaskDelete(NULL);
 }
