@@ -98,4 +98,22 @@ Heap used by create : 0 bytes (no dynamic allocation needed)
 Heap free / min     : 267440 / 263232 bytes
 Task stack          : 8192 bytes allocated, 7148 bytes never used
 
-Done. Press EN to run again.
+===== ADPCM (IMA/DVI4) encode benchmark =====
+CPU clock           : 240 MHz
+Format              : 16000 Hz mono, 20 ms frames (320 samples)
+Settings            : 4 bits/sample, fixed-rate (no VBR, no complexity knob)
+Frames timed        : 1250 (5 passes x 250 frames)
+Cycles/frame        : min 19458  avg 19484  max 19507 (worst = frame 126)
+Cycles/frame spread : 0.3 % ((max-min)/avg) -- compare to Opus's content-dependent spread
+Cycles/sample       : 60.9
+Time/frame          : avg 81.2 us  max 81.3 us  (budget 20000 us)
+CPU load (1 core)   : avg 0.4 %  worst-case 0.4 %
+Real-time (average) : YES
+Real-time (worst)   : YES
+Output              : 160 bytes/frame (fixed), 64000 bps, 4x compression vs 16-bit PCM
+Output hash (FNV-1a): 0xF7E5FE50   (must not change after optimizing)
+Deterministic       : YES (all passes identical)
+Encoder state size  : 4 bytes (sizeof adpcm_state_t)
+Heap used by create : 0 bytes (no dynamic allocation needed)
+Heap free / min     : 139644 / 135436 bytes
+Task stack          : 8192 bytes allocated, 7144 bytes never used

@@ -7,7 +7,11 @@
  * same math used by .wav IMA-ADPCM, DVI4, and most textbook ADPCM examples)
  * instead of libopus. Reports CPU cycles per 20 ms frame, memory use, and a
  * hash of the encoded output, in the same format as the Opus benchmark so
- * the two codecs can be compared directly.
+ * the two codecs can be compared directly. Uses a longer test clip than the
+ * Opus benchmark (BENCH_DURATION_S seconds vs. Opus's 1 s) and prints a
+ * cycles/frame spread + cycles/sample figure, specifically so the "ADPCM is
+ * way cheaper than Opus" result can be checked against more content rather
+ * than taken on faith from one second of audio.
  *
  * Unlike Opus (variable bitrate, big adaptive predictor, ~15 KB state),
  * ADPCM here is fixed-rate: every 16-bit sample always becomes exactly 4
@@ -39,7 +43,14 @@
 #define FRAME_MS              20
 #define FRAME_SAMPLES         (SAMPLE_RATE_HZ * FRAME_MS / 1000)   // 320
 #define FRAME_BYTES           (FRAME_SAMPLES / 2)                  // 160 (4 bits/sample)
-#define NUM_FRAMES            50      // frames per pass (1 second of audio)
+
+// Longer than the Opus benchmark's 1 s clip (50 frames) on purpose: ADPCM's
+// per-sample cost is nearly content-independent (fixed branch count, no
+// adaptive search), so a longer run is a good way to confirm cycles/frame
+// stays flat rather than just being an artifact of a short sample. At
+// 5 s this still only needs ~156 KB for g_pcm, well inside free DRAM.
+#define BENCH_DURATION_S      5
+#define NUM_FRAMES            (BENCH_DURATION_S * 1000 / FRAME_MS)   // 250 frames = 5 s
 #define NUM_PASSES            5       // timed passes (after 1 untimed warm-up pass)
 
 // ADPCM needs only a couple of bytes of state, so a small task stack is
@@ -236,6 +247,9 @@ static void bench_task(void *arg)
                (unsigned)timed_frames, NUM_PASSES, NUM_FRAMES);
         printf("Cycles/frame        : min %" PRIu32 "  avg %" PRIu32 "  max %" PRIu32 " (worst = frame %u)\n",
                min_cycles, avg_cycles, max_cycles, (unsigned)worst_frame);
+        printf("Cycles/frame spread : %.1f %% ((max-min)/avg) -- compare to Opus's content-dependent spread\n",
+               100.0f * (float)(max_cycles - min_cycles) / (float)avg_cycles);
+        printf("Cycles/sample       : %.1f\n", (float)avg_cycles / (float)FRAME_SAMPLES);
         printf("Time/frame          : avg %.1f us  max %.1f us  (budget %.0f us)\n",
                avg_us, max_us, budget_us);
         printf("CPU load (1 core)   : avg %.1f %%  worst-case %.1f %%\n",
