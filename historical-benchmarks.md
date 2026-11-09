@@ -1,8 +1,9 @@
-> **Current scope:** complexity 0 is the sole optimization target. The goal is to improve
-> speed, memory efficiency, and measured energy/power on the ESP32. Complexities 2, 5,
-> and 10 are comparison measurements only, not optimization targets or acceptance criteria.
-> Power is not measured by these cycle-count logs; use a separate documented measurement.
-> Compare optimization changes at complexity 0 with the same input/build settings.
+# Historical Benchmark Records
+
+This archive preserves captured benchmark and profiling output from multiple builds and
+experiments. Settings and metrics differ between entries, so compare runs only when their
+recorded conditions match. Current project scope, measurement rules, and workflow are in
+[AGENTS.md](AGENTS.md).
 
 ### Base, Compiler Options: Debug, 160MHz
 

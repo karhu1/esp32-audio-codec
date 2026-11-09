@@ -23,6 +23,7 @@ build/
 *.a
 *.out
 *.exe # For any host-side utilities compiled on Windows
+out/matplotlib/
 
 # ESP-IDF specific build outputs
 *.bin
@@ -58,7 +59,7 @@ dist/
 
 # Virtual environment folders
 venv/
-.venv/
+/.venv/
 env/
 
 # Language Servers

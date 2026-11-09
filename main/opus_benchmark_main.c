@@ -65,6 +65,18 @@ static uint8_t  g_pkt[1276];                 // 1276 bytes is the largest possib
 static uint32_t g_frame_cycle_sum[NUM_FRAMES];   // summed over the timed passes
 static uint16_t g_frame_bytes[NUM_FRAMES];       // packet size (identical every pass)
 static uint8_t  g_frame_config[NUM_FRAMES];      // Opus TOC config number (mode/bandwidth)
+/* Preserve complexity 0 data for the JSON block, which is printed after the sweep. */
+static uint32_t g_c0_frame_cycle_sum[NUM_FRAMES];
+static uint16_t g_c0_frame_bytes[NUM_FRAMES];
+static uint8_t  g_c0_frame_config[NUM_FRAMES];
+
+typedef struct {
+    size_t dram_free;
+    size_t dram_largest;
+    size_t exec_free;
+    size_t exec_largest;
+    UBaseType_t stack_unused;
+} memory_snapshot_t;
 
 typedef struct {
     int      complexity;
@@ -77,10 +89,28 @@ typedef struct {
     bool     deterministic;
     int      enc_size;
     size_t   heap_used;
+    memory_snapshot_t memory_before_create;
+    memory_snapshot_t memory_after_create;
+    memory_snapshot_t memory_after_encode;
+    memory_snapshot_t memory_after_destroy;
 } result_t;
 
 static result_t g_res[NUM_COMPLEXITIES];
 static opus_bench_profile_t g_stage_profile;
+
+static memory_snapshot_t capture_memory_snapshot(void)
+{
+    const uint32_t dram_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    const uint32_t exec_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_EXEC;
+    memory_snapshot_t snapshot = {
+        .dram_free = heap_caps_get_free_size(dram_caps),
+        .dram_largest = heap_caps_get_largest_free_block(dram_caps),
+        .exec_free = heap_caps_get_free_size(exec_caps),
+        .exec_largest = heap_caps_get_largest_free_block(exec_caps),
+        .stack_unused = uxTaskGetStackHighWaterMark(NULL),
+    };
+    return snapshot;
+}
 
 // ---- Test signal -----------------------------------------------------------
 // A "voiced speech" stand-in: a wobbling-pitch harmonic series with a slow
@@ -136,6 +166,84 @@ static const char *opt_level_name(void)
 #endif
 }
 
+/* Print a JSON string with escaping so toolchain/version text cannot corrupt the
+ * machine-readable result block. */
+static void print_json_string(const char *s)
+{
+    putchar('"');
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\') {
+            putchar('\\');
+            putchar(c);
+        } else if (c == '\n') printf("\\n");
+        else if (c == '\r') printf("\\r");
+        else if (c == '\t') printf("\\t");
+        else if (c >= 0x20) putchar(c);
+    }
+    putchar('"');
+}
+
+static void print_memory_record(int complexity, const char *stage,
+                                const memory_snapshot_t *snapshot)
+{
+    printf("{\"type\":\"memory\",\"complexity\":%d,\"stage\":\"%s\","
+           "\"dram_8bit_internal_free_bytes\":%u,\"dram_8bit_internal_largest_block_bytes\":%u,"
+           "\"executable_internal_free_bytes\":%u,\"executable_internal_largest_block_bytes\":%u,"
+           "\"task_stack_unused_bytes\":%u}\n",
+           complexity, stage,
+           (unsigned)snapshot->dram_free, (unsigned)snapshot->dram_largest,
+           (unsigned)snapshot->exec_free, (unsigned)snapshot->exec_largest,
+           (unsigned)snapshot->stack_unused);
+}
+
+/* Delimited JSON Lines block: monitor noise outside the markers is ignored. */
+static void print_machine_results(const uint32_t cpu_mhz)
+{
+    printf("\n===OPUS_BENCH_JSON_V1_BEGIN===\n");
+    printf("{\"type\":\"run\",\"schema\":1,\"cpu_mhz\":%u,\"sample_rate_hz\":%d,\"channels\":1,\"frame_ms\":%d,\"frame_samples\":%d,\"target_bitrate\":%d,\"passes\":%d,\"frames_per_pass\":%d,\"benchmark_task_stack_bytes\":%u,\"optimization\":",
+           (unsigned)cpu_mhz, SAMPLE_RATE_HZ, FRAME_MS, FRAME_SAMPLES,
+           BENCH_BITRATE, NUM_PASSES, NUM_FRAMES, (unsigned)BENCH_TASK_STACK_BYTES);
+    print_json_string(opt_level_name());
+    printf(",\"opus_version\":");
+    print_json_string(opus_get_version_string());
+    printf("}\n");
+
+    for (int i = 0; i < NUM_COMPLEXITIES; i++) {
+        const result_t *r = &g_res[i];
+        printf("{\"type\":\"summary\",\"complexity\":%d,\"ok\":%s,\"timed_frames\":%" PRIu32,
+               r->complexity, r->ok ? "true" : "false", r->timed_frames);
+        if (r->ok && r->timed_frames > 0) {
+            printf(",\"min_cycles\":%" PRIu32 ",\"avg_cycles\":%" PRIu32
+                   ",\"max_cycles\":%" PRIu32 ",\"worst_frame\":%" PRIu32
+                   ",\"total_bytes\":%" PRIu32 ",\"silk_frames\":%" PRIu32
+                   ",\"hybrid_frames\":%" PRIu32 ",\"celt_frames\":%" PRIu32
+                   ",\"hash\":\"0x%08" PRIX32 "\",\"deterministic\":%s",
+                   r->min_cycles, r->avg_cycles, r->max_cycles, r->worst_frame,
+                   r->total_bytes, r->silk, r->hybrid, r->celt, r->hash,
+                   r->deterministic ? "true" : "false");
+        }
+        printf("}\n");
+        if (r->ok && r->timed_frames > 0) {
+            print_memory_record(r->complexity, "before_create", &r->memory_before_create);
+            print_memory_record(r->complexity, "after_create", &r->memory_after_create);
+            print_memory_record(r->complexity, "after_encode", &r->memory_after_encode);
+            print_memory_record(r->complexity, "after_destroy", &r->memory_after_destroy);
+        }
+    }
+
+    if (g_res[0].ok && g_res[0].complexity == 0) {
+        for (int f = 0; f < NUM_FRAMES; f++) {
+            uint32_t avg_cycles = g_c0_frame_cycle_sum[f] / NUM_PASSES;
+            printf("{\"type\":\"frame\",\"complexity\":0,\"frame\":%d,\"avg_cycles\":%" PRIu32
+                   ",\"avg_us\":%.2f,\"bytes\":%u,\"toc_config\":%u}\n",
+                   f, avg_cycles, (float)avg_cycles / (float)cpu_mhz,
+                   (unsigned)g_c0_frame_bytes[f], (unsigned)g_c0_frame_config[f]);
+        }
+    }
+    printf("===OPUS_BENCH_JSON_V1_END===\n");
+}
+
 // ---- One complexity level --------------------------------------------------
 static void run_config(int complexity, result_t *r)
 {
@@ -146,6 +254,7 @@ static void run_config(int complexity, result_t *r)
 
     for (int f = 0; f < NUM_FRAMES; f++) g_frame_cycle_sum[f] = 0;
 
+    r->memory_before_create = capture_memory_snapshot();
     size_t heap_before = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     int err = 0;
     OpusEncoder *enc = opus_encoder_create(SAMPLE_RATE_HZ, 1, OPUS_APPLICATION_VOIP, &err);
@@ -154,6 +263,7 @@ static void run_config(int complexity, result_t *r)
         r->ok = false;
         return;
     }
+    r->memory_after_create = capture_memory_snapshot();
     r->heap_used = heap_before - heap_caps_get_free_size(MALLOC_CAP_8BIT);
     r->enc_size  = opus_encoder_get_size(1);
 
@@ -216,7 +326,9 @@ static void run_config(int complexity, result_t *r)
     r->hash = ref_hash;
     if (r->timed_frames > 0) r->avg_cycles = (uint32_t)(sum_cycles / r->timed_frames);
 
+    r->memory_after_encode = capture_memory_snapshot();
     opus_encoder_destroy(enc);
+    r->memory_after_destroy = capture_memory_snapshot();
 }
 
 static void print_per_frame(int complexity, const uint32_t cpu_mhz)
@@ -277,6 +389,13 @@ static void bench_task(void *arg)
         printf("  complexity %d ...\n", k_complexities[i]);
         run_config(k_complexities[i], &g_res[i]);
         if (!g_res[i].ok) break;
+        if (k_complexities[i] == 0) {
+            for (int f = 0; f < NUM_FRAMES; f++) {
+                g_c0_frame_cycle_sum[f] = g_frame_cycle_sum[f];
+                g_c0_frame_bytes[f] = g_frame_bytes[f];
+                g_c0_frame_config[f] = g_frame_config[f];
+            }
+        }
         if (k_complexities[i] == PER_FRAME_LOG_COMPLEXITY) print_per_frame(k_complexities[i], cpu_mhz);
     }
 
@@ -325,6 +444,8 @@ static void bench_task(void *arg)
            (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT));
     printf("Task stack          : %u bytes allocated, %u bytes never used\n",
            (unsigned)BENCH_TASK_STACK_BYTES, (unsigned)uxTaskGetStackHighWaterMark(NULL));
+
+    print_machine_results(cpu_mhz);
 
     printf("\nDone. Press EN to run again.\n");
     vTaskDelete(NULL);
