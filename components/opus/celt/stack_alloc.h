@@ -115,6 +115,21 @@
 
 #else
 
+#ifdef OPUS_ESP32_PER_CORE_STACK
+/* One pseudostack per CPU core so two encoders can run on different cores at
+   once. Safe only if each core runs at most one Opus task (pinned tasks). */
+#include "esp_cpu.h"
+#define OPUS_STACK_CORES 2
+#ifdef CELT_C
+char *opus_core_scratch_ptr[OPUS_STACK_CORES]={0};
+char *opus_core_global_stack[OPUS_STACK_CORES]={0};
+#else
+extern char *opus_core_scratch_ptr[OPUS_STACK_CORES];
+extern char *opus_core_global_stack[OPUS_STACK_CORES];
+#endif /* CELT_C */
+#define scratch_ptr  (opus_core_scratch_ptr[esp_cpu_get_core_id()])
+#define global_stack (opus_core_global_stack[esp_cpu_get_core_id()])
+#else
 #ifdef CELT_C
 char *scratch_ptr=0;
 char *global_stack=0;
@@ -122,6 +137,7 @@ char *global_stack=0;
 extern char *global_stack;
 extern char *scratch_ptr;
 #endif /* CELT_C */
+#endif /* OPUS_ESP32_PER_CORE_STACK */
 
 #if __STDC_VERSION__ >= 201112L
 #  include <stdalign.h>

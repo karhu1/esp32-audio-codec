@@ -40,8 +40,11 @@ typedef struct {
     uint32_t calls[OPUS_BENCH_STAGE_COUNT];
 } opus_bench_profile_t;
 
+#define OPUS_BENCH_NUM_CORES 2
+
 void opus_bench_profile_reset(void);
 void opus_bench_profile_read(opus_bench_profile_t *profile);
+void opus_bench_profile_read_core(int core_id, opus_bench_profile_t *profile);
 uint32_t opus_bench_profile_now(void);
 void opus_bench_profile_record(opus_bench_stage_t stage, uint32_t start);
 

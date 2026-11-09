@@ -654,3 +654,8 @@ Task stack          : 24576 bytes allocated, 20852 bytes never used
 
 Done. Press EN to run again.
 ```
+Running Dual-Core Producer-Consumer Handoff (Complexity 0)...
+Handoff C0 (PRO) staging avg: 434 cycles (1.8 us)
+Handoff C1 (APP) encode avg : 2057966 cycles (8574.9 us), max: 2318839 cycles (9661.8 us)
+Handoff hash check          : 0x317FC6D7 -> MATCH, deterministic
+(Core 0 only stages PCM; core 1 runs the whole encode. This measures handoff overhead, not a split of Opus stages.)

@@ -36,7 +36,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #ifdef OPUS_BENCH_STAGE_PROFILE
 #include "opus_bench_profile.h"
 
-static opus_bench_profile_t opus_bench_profile;
+static opus_bench_profile_t __attribute__((aligned(32))) opus_bench_profile[OPUS_BENCH_NUM_CORES];
 
 uint32_t opus_bench_profile_now(void)
 {
@@ -47,8 +47,18 @@ uint32_t opus_bench_profile_now(void)
 
 void opus_bench_profile_record(opus_bench_stage_t stage, uint32_t start)
 {
-    opus_bench_profile.cycles[stage] += (uint32_t)(opus_bench_profile_now() - start);
-    opus_bench_profile.calls[stage]++;
+    uint32_t elapsed = esp_cpu_get_cycle_count() - start;
+    int core = esp_cpu_get_core_id();
+    if ((unsigned)stage < OPUS_BENCH_STAGE_COUNT && (unsigned)core < OPUS_BENCH_NUM_CORES) {
+        opus_bench_profile[core].cycles[stage] += elapsed;
+        opus_bench_profile[core].calls[stage]  += 1;
+    }
+}
+
+void opus_bench_profile_read_core(int core_id, opus_bench_profile_t *profile)
+{
+    if (!profile || (unsigned)core_id >= OPUS_BENCH_NUM_CORES) return;
+    *profile = opus_bench_profile[core_id];
 }
 
 void opus_bench_profile_reset(void)
@@ -58,7 +68,14 @@ void opus_bench_profile_reset(void)
 
 void opus_bench_profile_read(opus_bench_profile_t *profile)
 {
-    silk_memcpy(profile, &opus_bench_profile, sizeof(*profile));
+    if (!profile) return;
+    memset(profile, 0, sizeof(*profile));
+    for (int c = 0; c < OPUS_BENCH_NUM_CORES; c++) {
+        for (int s = 0; s < OPUS_BENCH_STAGE_COUNT; s++) {
+            profile->cycles[s] += opus_bench_profile[c].cycles[s];
+            profile->calls[s]  += opus_bench_profile[c].calls[s];
+        }
+    }
 }
 #endif
 

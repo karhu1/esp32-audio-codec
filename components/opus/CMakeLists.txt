@@ -29,6 +29,8 @@ function(opus_collect_sources variable makefile output)
     if(NOT found_variable OR NOT sources)
         message(FATAL_ERROR "Could not read ${variable} from ${OPUS_ROOT}/${makefile}")
     endif()
+    list(TRANSFORM sources STRIP)
+    list(REMOVE_ITEM sources "")
     set(${output} "${sources}" PARENT_SCOPE)
 endfunction()
 
@@ -64,6 +66,7 @@ if(NOT CMAKE_BUILD_EARLY_EXPANSION)
         OPUS_XTENSA_LX7
         FIXED_POINT=1
         NONTHREADSAFE_PSEUDOSTACK
+        OPUS_ESP32_PER_CORE_STACK
         GLOBAL_STACK_SIZE=60000
         HAVE_LRINT
         HAVE_LRINTF
