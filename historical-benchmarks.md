@@ -1,8 +1,9 @@
-> **Current scope:** complexity 0 is the sole optimization target. The goal is to improve
-> speed, memory efficiency, and measured energy/power on the ESP32. Complexities 2, 5,
-> and 10 are comparison measurements only, not optimization targets or acceptance criteria.
-> Power is not measured by these cycle-count logs; use a separate documented measurement.
-> Compare optimization changes at complexity 0 with the same input/build settings.
+# Historical Benchmark Records
+
+This archive preserves captured benchmark and profiling output from multiple builds and
+experiments. Settings and metrics differ between entries, so compare runs only when their
+recorded conditions match. Current project scope, measurement rules, and workflow are in
+[AGENTS.md](AGENTS.md).
 
 ### Base, Compiler Options: Debug, 160MHz
 
@@ -659,3 +660,29 @@ Handoff C0 (PRO) staging avg: 434 cycles (1.8 us)
 Handoff C1 (APP) encode avg : 2057966 cycles (8574.9 us), max: 2318839 cycles (9661.8 us)
 Handoff hash check          : 0x317FC6D7 -> MATCH, deterministic
 (Core 0 only stages PCM; core 1 runs the whole encode. This measures handoff overhead, not a split of Opus stages.)
+
+## 2026-11-11: file-input groundwork and parallel-memory check
+
+Captured with ESP-IDF 6.1, `-O2`, 240 MHz, 16 kHz mono, 20 ms frames, 20 kbps VBR, and
+complexities 0, 2, 5, and 10. The complexity-0 output remained deterministic and matched
+the `0x317FC6D7` baseline hash.
+
+| Complexity | Core 1 average | Core 1 maximum | Real-time result |
+|---:|---:|---:|:---|
+| 0 | 2,012,984 cycles (8.39 ms) | 2,291,481 cycles (9.55 ms) | Pass |
+| 2 | 2,494,091 cycles (10.39 ms) | 2,771,802 cycles (11.55 ms) | Pass |
+| 5 | 3,276,007 cycles (13.65 ms) | 3,539,619 cycles (14.75 ms) | Pass |
+| 10 | 5,831,501 cycles (24.30 ms) | 6,073,188 cycles (25.31 ms) | Fail |
+
+The simultaneous two-encoder sweep failed before encoding. Both workers reported Opus
+allocation failure (`-7`) at complexities 0, 5, and 10; at complexity 2, a worker task also
+failed to allocate. The ordinary single-core run retained one 61,444-byte pseudostack after
+encoder destruction. Running the Core 0 baseline allocated a second per-core pseudostack,
+leaving too little headroom for two encoder states and two 24 KiB worker stacks. The test
+was removed from the active run path; do not interpret its output as dual-core throughput.
+
+The producer-consumer handoff completed successfully on the synthetic input. Core 0 staging
+averaged 434 cycles (1.8 us); Core 1 encoding averaged 2,009,924 cycles (8.37 ms), with a
+2,254,199-cycle (9.39 ms) maximum. Measured end-to-end handoff time was 8,499 us per frame.
+The packet hash was `0x317FC6D7` and remained deterministic. This handoff still uses the
+in-memory synthetic PCM; it is not the planned PC-to-device file stream.

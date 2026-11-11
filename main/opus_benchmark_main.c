@@ -29,6 +29,7 @@
 #include "freertos/event_groups.h"
 #include "esp_cpu.h"        // esp_cpu_get_cycle_count()
 #include "esp_rom_sys.h"    // esp_rom_get_cpu_ticks_per_us()
+#include "esp_timer.h"      // esp_timer_get_time()
 #include "esp_heap_caps.h"  // heap_caps_get_free_size()
 #include "opus.h"
 #include "opus_bench_profile.h"
@@ -65,12 +66,24 @@ static const int k_complexities[] = {0, 2, 5, 10};
 // ---- Buffers (static, so they live in internal RAM, not on a stack) --------
 static int16_t  g_pcm[NUM_FRAMES * FRAME_SAMPLES];
 static uint8_t  g_pkt[1276];                 // Single-core packet buffer
-static uint8_t  g_pkt_dual[2][1276];         // Per-core packet buffers for dual-core runs
+
 
 // Per-frame statistics (reused for every complexity level).
 static uint32_t g_frame_cycle_sum[NUM_FRAMES];   // summed over the timed passes
 static uint16_t g_frame_bytes[NUM_FRAMES];       // packet size (identical every pass)
 static uint8_t  g_frame_config[NUM_FRAMES];      // Opus TOC config number (mode/bandwidth)
+/* Preserve complexity 0 data for the JSON block, which is printed after the sweep. */
+static uint32_t g_c0_frame_cycle_sum[NUM_FRAMES];
+static uint16_t g_c0_frame_bytes[NUM_FRAMES];
+static uint8_t  g_c0_frame_config[NUM_FRAMES];
+
+typedef struct {
+    size_t dram_free;
+    size_t dram_largest;
+    size_t exec_free;
+    size_t exec_largest;
+    UBaseType_t stack_unused;
+} memory_snapshot_t;
 
 typedef struct {
     int      complexity;
@@ -83,19 +96,11 @@ typedef struct {
     bool     deterministic;
     int      enc_size;
     size_t   heap_used;
+    memory_snapshot_t memory_before_create;
+    memory_snapshot_t memory_after_create;
+    memory_snapshot_t memory_after_encode;
+    memory_snapshot_t memory_after_destroy;
 } result_t;
-
-typedef struct {
-    int      complexity;
-    bool     ok;
-    result_t core[2];                // Individual metrics for Core 0 (PRO) and Core 1 (APP)
-    uint32_t wall_avg_us_per_frame;  // Slower core's average encode time; both cores overlap, so this is the time per frame pair
-    float    throughput_streams;     // Real-time streams supported, from the slower core's average
-    float    throughput_streams_worst; // Same, from the slower core's worst frame
-    float    contention_pct[2];      // Per-core cycle overhead vs. that same core encoding alone
-    size_t   dual_heap_used;         // Includes the two worker task stacks, not just the encoders
-    size_t   min_heap_free;
-} dual_parallel_result_t;
 
 typedef struct {
     int      complexity;
@@ -108,14 +113,25 @@ typedef struct {
     bool     deterministic;
 } dual_pipeline_result_t;
 
-static result_t               g_res[NUM_COMPLEXITIES];        // single stream, encoding on core 1
-static result_t               g_core0_res[NUM_COMPLEXITIES];  // single stream, encoding on core 0
-static dual_parallel_result_t g_dual_par_res[NUM_COMPLEXITIES];
+static result_t               g_res[NUM_COMPLEXITIES];
 static dual_pipeline_result_t g_dual_pipe_res;
 static opus_bench_profile_t   g_stage_profile;
-static opus_bench_profile_t   g_dual_stage_profile[2];
 
 
+
+static memory_snapshot_t capture_memory_snapshot(void)
+{
+    const uint32_t dram_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    const uint32_t exec_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_EXEC;
+    memory_snapshot_t snapshot = {
+        .dram_free = heap_caps_get_free_size(dram_caps),
+        .dram_largest = heap_caps_get_largest_free_block(dram_caps),
+        .exec_free = heap_caps_get_free_size(exec_caps),
+        .exec_largest = heap_caps_get_largest_free_block(exec_caps),
+        .stack_unused = uxTaskGetStackHighWaterMark(NULL),
+    };
+    return snapshot;
+}
 
 // ---- Test signal -----------------------------------------------------------
 // A "voiced speech" stand-in: a wobbling-pitch harmonic series with a slow
@@ -171,6 +187,98 @@ static const char *opt_level_name(void)
 #endif
 }
 
+/* Print a JSON string with escaping so toolchain/version text cannot corrupt the
+ * machine-readable result block. */
+static void print_json_string(const char *s)
+{
+    putchar('"');
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\') {
+            putchar('\\');
+            putchar(c);
+        } else if (c == '\n') printf("\\n");
+        else if (c == '\r') printf("\\r");
+        else if (c == '\t') printf("\\t");
+        else if (c >= 0x20) putchar(c);
+    }
+    putchar('"');
+}
+
+static void print_memory_record(int complexity, const char *stage,
+                                const memory_snapshot_t *snapshot)
+{
+    printf("{\"type\":\"memory\",\"complexity\":%d,\"stage\":\"%s\","
+           "\"dram_8bit_internal_free_bytes\":%u,\"dram_8bit_internal_largest_block_bytes\":%u,"
+           "\"executable_internal_free_bytes\":%u,\"executable_internal_largest_block_bytes\":%u,"
+           "\"task_stack_unused_bytes\":%u}\n",
+           complexity, stage,
+           (unsigned)snapshot->dram_free, (unsigned)snapshot->dram_largest,
+           (unsigned)snapshot->exec_free, (unsigned)snapshot->exec_largest,
+           (unsigned)snapshot->stack_unused);
+}
+
+/* Delimited JSON Lines block: monitor noise outside the markers is ignored. */
+static void print_machine_results(const uint32_t cpu_mhz)
+{
+    printf("\n===OPUS_BENCH_JSON_V1_BEGIN===\n");
+    printf("{\"type\":\"run\",\"schema\":1,\"cpu_mhz\":%u,\"sample_rate_hz\":%d,\"channels\":1,\"frame_ms\":%d,\"frame_samples\":%d,\"target_bitrate\":%d,\"passes\":%d,\"frames_per_pass\":%d,\"benchmark_task_stack_bytes\":%u,\"optimization\":",
+           (unsigned)cpu_mhz, SAMPLE_RATE_HZ, FRAME_MS, FRAME_SAMPLES,
+           BENCH_BITRATE, NUM_PASSES, NUM_FRAMES, (unsigned)BENCH_TASK_STACK_BYTES);
+    print_json_string(opt_level_name());
+    printf(",\"opus_version\":");
+    print_json_string(opus_get_version_string());
+    printf("}\n");
+
+    for (int i = 0; i < NUM_COMPLEXITIES; i++) {
+        const result_t *r = &g_res[i];
+        printf("{\"type\":\"summary\",\"complexity\":%d,\"ok\":%s,\"timed_frames\":%" PRIu32,
+               r->complexity, r->ok ? "true" : "false", r->timed_frames);
+        if (r->ok && r->timed_frames > 0) {
+            printf(",\"min_cycles\":%" PRIu32 ",\"avg_cycles\":%" PRIu32
+                   ",\"max_cycles\":%" PRIu32 ",\"worst_frame\":%" PRIu32
+                   ",\"total_bytes\":%" PRIu32 ",\"silk_frames\":%" PRIu32
+                   ",\"hybrid_frames\":%" PRIu32 ",\"celt_frames\":%" PRIu32
+                   ",\"hash\":\"0x%08" PRIX32 "\",\"deterministic\":%s",
+                   r->min_cycles, r->avg_cycles, r->max_cycles, r->worst_frame,
+                   r->total_bytes, r->silk, r->hybrid, r->celt, r->hash,
+                   r->deterministic ? "true" : "false");
+        }
+        printf("}\n");
+        if (r->ok && r->timed_frames > 0) {
+            print_memory_record(r->complexity, "before_create", &r->memory_before_create);
+            print_memory_record(r->complexity, "after_create", &r->memory_after_create);
+            print_memory_record(r->complexity, "after_encode", &r->memory_after_encode);
+            print_memory_record(r->complexity, "after_destroy", &r->memory_after_destroy);
+        }
+    }
+
+    if (g_res[0].ok && g_res[0].complexity == 0) {
+        for (int f = 0; f < NUM_FRAMES; f++) {
+            uint32_t avg_cycles = g_c0_frame_cycle_sum[f] / NUM_PASSES;
+            printf("{\"type\":\"frame\",\"complexity\":0,\"frame\":%d,\"avg_cycles\":%" PRIu32
+                   ",\"avg_us\":%.2f,\"bytes\":%u,\"toc_config\":%u}\n",
+                   f, avg_cycles, (float)avg_cycles / (float)cpu_mhz,
+                   (unsigned)g_c0_frame_bytes[f], (unsigned)g_c0_frame_config[f]);
+        }
+    }
+    const dual_pipeline_result_t *pipe = &g_dual_pipe_res;
+    printf("{\"type\":\"dual_pipeline\",\"complexity\":%d,\"ok\":%s",
+           pipe->complexity, pipe->ok ? "true" : "false");
+    if (pipe->ok) {
+        printf(",\"core0_staging_avg_cycles\":%" PRIu32
+               ",\"core1_encode_avg_cycles\":%" PRIu32
+               ",\"core1_encode_max_cycles\":%" PRIu32
+               ",\"wall_avg_us_per_frame\":%" PRIu32
+               ",\"hash\":\"0x%08" PRIX32 "\",\"deterministic\":%s",
+               pipe->core0_avg_cycles, pipe->core1_avg_cycles,
+               pipe->core1_max_cycles, pipe->wall_avg_us,
+               pipe->hash, pipe->deterministic ? "true" : "false");
+    }
+    printf("}\n");
+    printf("===OPUS_BENCH_JSON_V1_END===\n");
+}
+
 // ---- One complexity level --------------------------------------------------
 static void run_config(int complexity, result_t *r)
 {
@@ -181,6 +289,7 @@ static void run_config(int complexity, result_t *r)
 
     for (int f = 0; f < NUM_FRAMES; f++) g_frame_cycle_sum[f] = 0;
 
+    r->memory_before_create = capture_memory_snapshot();
     size_t heap_before = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     int err = 0;
     OpusEncoder *enc = opus_encoder_create(SAMPLE_RATE_HZ, 1, OPUS_APPLICATION_VOIP, &err);
@@ -189,6 +298,7 @@ static void run_config(int complexity, result_t *r)
         r->ok = false;
         return;
     }
+    r->memory_after_create = capture_memory_snapshot();
     r->heap_used = heap_before - heap_caps_get_free_size(MALLOC_CAP_8BIT);
     r->enc_size  = opus_encoder_get_size(1);
 
@@ -251,7 +361,9 @@ static void run_config(int complexity, result_t *r)
     r->hash = ref_hash;
     if (r->timed_frames > 0) r->avg_cycles = (uint32_t)(sum_cycles / r->timed_frames);
 
+    r->memory_after_encode = capture_memory_snapshot();
     opus_encoder_destroy(enc);
+    r->memory_after_destroy = capture_memory_snapshot();
 }
 
 static void print_per_frame(int complexity, const uint32_t cpu_mhz)
@@ -309,215 +421,8 @@ static void print_stage_profile(void)
     printf("(Parent and child totals overlap: predictor, SILK frame, SILK API, and Opus frame totals are inclusive.)\n");
 }
 
-// Per-stage cost with both cores encoding at once, next to the single-stream run on core 1,
-// so the stages that slow down under shared flash/SRAM contention stand out.
-static void print_dual_stage_profile(void)
-{
-    int prof_idx = stage_profile_index();
-    if (prof_idx < 0 || !g_dual_par_res[prof_idx].ok || !g_res[prof_idx].ok) return;
-
-    printf("\n--- SILK stage profile, complexity %d, both cores encoding at once (avg cycles/call) ---\n",
-           STAGE_PROFILE_COMPLEXITY);
-    printf("stage, core0 dual, core1 dual, core1 solo\n");
-    for (int i = 0; i < OPUS_BENCH_STAGE_COUNT; i++) {
-        if (g_dual_stage_profile[1].calls[i] == 0 && g_stage_profile.calls[i] == 0) continue;
-        printf("%s, %" PRIu64 ", %" PRIu64 ", %" PRIu64 "\n", k_stage_names[i],
-               stage_avg(&g_dual_stage_profile[0], i), stage_avg(&g_dual_stage_profile[1], i),
-               stage_avg(&g_stage_profile, i));
-    }
-}
-
 // ---- Benchmark task --------------------------------------------------------
-// ---- Dual-Core Mode 1: Parallel Dual-Stream Workers (Core 0 + Core 1) ------
-#define EVT_C0_READY    (1 << 0)
-#define EVT_C1_READY    (1 << 1)
-#define EVT_PASS_GO     (1 << 2)
-#define EVT_C0_DONE     (1 << 3)
-#define EVT_C1_DONE     (1 << 4)
-#define EVT_BOTH_READY  (EVT_C0_READY | EVT_C1_READY)
-#define EVT_BOTH_DONE   (EVT_C0_DONE  | EVT_C1_DONE)
-
-typedef struct {
-    int                   core_id;
-    int                   complexity;
-    EventGroupHandle_t    eg;
-    EventBits_t           ready_all;   // READY bits of every worker taking part in this run
-    result_t             *out;
-    opus_bench_profile_t *prof;        // if non-NULL, receives this core's timed-pass stage profile
-} dual_worker_arg_t;
-
-// Each core's profile counters are written only by that core, so the profile is taken as an
-// end-minus-warm-up difference. A reset from one core would wipe the other core's counters.
-static void profile_diff(const opus_bench_profile_t *end, const opus_bench_profile_t *base,
-                         opus_bench_profile_t *out)
-{
-    for (int s = 0; s < OPUS_BENCH_STAGE_COUNT; s++) {
-        out->cycles[s] = end->cycles[s] - base->cycles[s];
-        out->calls[s]  = end->calls[s]  - base->calls[s];
-    }
-}
-
-static void dual_parallel_worker_task(void *arg)
-{
-    dual_worker_arg_t *w = (dual_worker_arg_t *)arg;
-    result_t *r = w->out;
-    const int cid = w->core_id;
-    uint8_t *pkt_buf = g_pkt_dual[cid];
-
-    *r = (result_t){ .complexity = w->complexity, .ok = true,
-                     .min_cycles = UINT32_MAX, .deterministic = true };
-
-    int err = 0;
-    OpusEncoder *enc = opus_encoder_create(SAMPLE_RATE_HZ, 1, OPUS_APPLICATION_VOIP, &err);
-    if (err != OPUS_OK || enc == NULL) {
-        r->ok = false;
-        xEventGroupSetBits(w->eg, (cid == 0) ? EVT_C0_READY | EVT_C0_DONE : EVT_C1_READY | EVT_C1_DONE);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    opus_encoder_ctl(enc, OPUS_SET_BITRATE(BENCH_BITRATE));
-    opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(w->complexity));
-    opus_encoder_ctl(enc, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
-    opus_encoder_ctl(enc, OPUS_SET_VBR(1));
-
-    // Synchronize all participating cores before starting the pass sweep
-    EventBits_t ready_bit = (cid == 0) ? EVT_C0_READY : EVT_C1_READY;
-    xEventGroupSync(w->eg, ready_bit, w->ready_all | EVT_PASS_GO, portMAX_DELAY);
-
-    uint64_t sum_cycles = 0;
-    uint32_t ref_hash = 0;
-    opus_bench_profile_t prof_base = {0};
-
-    for (int pass = -1; pass < NUM_PASSES && r->ok; pass++) {
-        opus_encoder_ctl(enc, OPUS_RESET_STATE);
-        uint32_t hash = 2166136261u;
-
-        for (int f = 0; f < NUM_FRAMES; f++) {
-            const int16_t *in = &g_pcm[f * FRAME_SAMPLES];
-
-            uint32_t t0 = esp_cpu_get_cycle_count();
-            int n = opus_encode(enc, in, FRAME_SAMPLES, pkt_buf, (opus_int32)sizeof(g_pkt_dual[0]));
-            uint32_t t1 = esp_cpu_get_cycle_count();
-
-            if (n < 0) {
-                r->ok = false;
-                break;
-            }
-
-            hash = fnv1a(hash, pkt_buf, n);
-
-            if (pass >= 0) {
-                uint32_t cycles = t1 - t0;
-                if (cycles < r->min_cycles) r->min_cycles = cycles;
-                if (cycles > r->max_cycles) { r->max_cycles = cycles; r->worst_frame = (uint32_t)f; }
-                sum_cycles += cycles;
-                r->timed_frames++;
-                r->total_bytes += (uint32_t)n;
-
-                int config = pkt_buf[0] >> 3;
-                if (config < 12)      r->silk++;
-                else if (config < 16) r->hybrid++;
-                else                  r->celt++;
-            }
-
-            // Yield outside timed region every 10 frames so IDLE0/IDLE1 watchdogs stay fed
-            if ((f % 10) == 9) vTaskDelay(1);
-        }
-
-        if (pass == -1) {
-            ref_hash = hash;
-            if (w->prof) opus_bench_profile_read_core(cid, &prof_base);
-        } else if (hash != ref_hash) {
-            r->deterministic = false;
-        }
-    }
-
-    if (w->prof) {
-        opus_bench_profile_t prof_end;
-        opus_bench_profile_read_core(cid, &prof_end);
-        profile_diff(&prof_end, &prof_base, w->prof);
-    }
-
-    r->hash = ref_hash;
-    if (r->timed_frames > 0) r->avg_cycles = (uint32_t)(sum_cycles / r->timed_frames);
-
-    opus_encoder_destroy(enc);
-
-    EventBits_t done_bit = (cid == 0) ? EVT_C0_DONE : EVT_C1_DONE;
-    xEventGroupSetBits(w->eg, done_bit);
-    vTaskDelete(NULL);
-}
-
-// Runs one encoder worker on each core in `core_mask` (bit 0 = core 0, bit 1 = core 1) at the
-// same time. A single-bit mask gives the per-core solo baseline that the dual run is compared to.
-static void run_parallel_workers(int complexity, int core_mask, dual_parallel_result_t *dr)
-{
-    *dr = (dual_parallel_result_t){ .complexity = complexity, .ok = true };
-    EventGroupHandle_t eg = xEventGroupCreate();
-
-    const EventBits_t ready_all = ((core_mask & 1) ? EVT_C0_READY : 0) | ((core_mask & 2) ? EVT_C1_READY : 0);
-    const EventBits_t done_all  = ((core_mask & 1) ? EVT_C0_DONE  : 0) | ((core_mask & 2) ? EVT_C1_DONE  : 0);
-    const bool both = (core_mask == 3);
-
-    size_t heap_before = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-
-    dual_worker_arg_t args[2];
-    for (int c = 0; c < 2; c++) {
-        if (!(core_mask & (1 << c))) continue;
-        args[c] = (dual_worker_arg_t){
-            .core_id = c, .complexity = complexity, .eg = eg, .ready_all = ready_all,
-            .out  = &dr->core[c],
-            .prof = (both && complexity == STAGE_PROFILE_COMPLEXITY) ? &g_dual_stage_profile[c] : NULL,
-        };
-        xTaskCreatePinnedToCore(dual_parallel_worker_task, c ? "opus_c1" : "opus_c0",
-                                BENCH_TASK_STACK_BYTES, &args[c], 5, NULL, c);
-    }
-
-    // Wait until every encoder is allocated on heap and waiting at the barrier
-    xEventGroupWaitBits(eg, ready_all, pdFALSE, pdTRUE, portMAX_DELAY);
-    dr->dual_heap_used = heap_before - heap_caps_get_free_size(MALLOC_CAP_8BIT);
-    dr->min_heap_free  = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
-
-    xEventGroupSetBits(eg, EVT_PASS_GO);
-    xEventGroupWaitBits(eg, done_all, pdTRUE, pdTRUE, portMAX_DELAY);
-
-    vEventGroupDelete(eg);
-
-    for (int c = 0; c < 2; c++) {
-        if ((core_mask & (1 << c)) && !dr->core[c].ok) dr->ok = false;
-    }
-}
-
-// Both cores encode the same input in lockstep, which is the worst case for shared flash/SRAM
-// contention; the identical inputs also let both hashes be checked against the single-stream hash.
-static void run_dual_core_parallel(int idx, dual_parallel_result_t *dr)
-{
-    run_parallel_workers(k_complexities[idx], 3, dr);
-    if (!dr->ok) return;
-
-    const uint32_t cpu_mhz = esp_rom_get_cpu_ticks_per_us();
-    const float budget_us = (float)(FRAME_MS * 1000);
-    uint32_t slower_avg = (dr->core[0].avg_cycles > dr->core[1].avg_cycles)
-                        ? dr->core[0].avg_cycles : dr->core[1].avg_cycles;
-    uint32_t slower_max = (dr->core[0].max_cycles > dr->core[1].max_cycles)
-                        ? dr->core[0].max_cycles : dr->core[1].max_cycles;
-
-    // The cores overlap, so one frame pair completes per slower-core encode time.
-    dr->wall_avg_us_per_frame      = slower_avg / cpu_mhz;
-    dr->throughput_streams         = 2.0f * budget_us / ((float)slower_avg / (float)cpu_mhz);
-    dr->throughput_streams_worst   = 2.0f * budget_us / ((float)slower_max / (float)cpu_mhz);
-
-    // Compare each core against itself encoding alone (core 0 is not as quiet as core 1).
-    const uint32_t solo_avg[2] = { g_core0_res[idx].avg_cycles, g_res[idx].avg_cycles };
-    for (int c = 0; c < 2; c++) {
-        if (solo_avg[c] > 0) {
-            dr->contention_pct[c] = 100.0f * ((float)dr->core[c].avg_cycles - (float)solo_avg[c]) / (float)solo_avg[c];
-        }
-    }
-}
-
-// ---- Dual-Core Mode 2: Producer-Consumer Ping-Pong Handoff -----------------
+// ---- Dual-Core Producer-Consumer Handoff ----------------------------------
 // Core 0 stages each PCM frame into a ping-pong buffer while core 1 runs the whole
 // opus_encode(). This measures the cross-core handoff only; no Opus work is split
 // between the cores.
@@ -543,6 +448,11 @@ static void dual_pipe_consumer_core1(void *arg)
 
     // Task handles are written by the creator after this task exists; wait until they are valid.
     xEventGroupWaitBits(ctx->eg, PIPE_GO, pdFALSE, pdTRUE, portMAX_DELAY);
+    if (ctx->abort) {
+        xEventGroupSetBits(ctx->eg, PIPE_CONS_DONE);
+        vTaskDelete(NULL);
+        return;
+    }
 
     int err = 0;
     OpusEncoder *enc = opus_encoder_create(SAMPLE_RATE_HZ, 1, OPUS_APPLICATION_VOIP, &err);
@@ -560,12 +470,14 @@ static void dual_pipe_consumer_core1(void *arg)
     opus_encoder_ctl(enc, OPUS_SET_VBR(1));
 
     uint64_t sum_cycles = 0;
+    uint64_t sum_wall_us = 0;
     uint32_t max_cycles = 0;
     uint32_t ref_hash = 0;
 
     for (int pass = -1; pass < NUM_PASSES && r->ok; pass++) {
         opus_encoder_ctl(enc, OPUS_RESET_STATE);
         uint32_t hash = 2166136261u;
+        int64_t pass_start_us = (pass >= 0) ? esp_timer_get_time() : 0;
 
         for (int f = 0; f < NUM_FRAMES; f++) {
             // Wait for core 0 to stage frame f in ping_pong_pcm[slot]
@@ -576,29 +488,33 @@ static void dual_pipe_consumer_core1(void *arg)
 
             uint32_t t0 = esp_cpu_get_cycle_count();
             int n = opus_encode(enc, ctx->ping_pong_pcm[slot], FRAME_SAMPLES,
-                                g_pkt_dual[1], (opus_int32)sizeof(g_pkt_dual[1]));
+                                g_pkt, (opus_int32)sizeof(g_pkt));
             uint32_t t1 = esp_cpu_get_cycle_count();
 
             if (n < 0) {
+                printf("dual pipeline core 1 complexity %d: opus_encode failed on pass %d frame %d: %s (%d)\n",
+                       ctx->complexity, pass, f, opus_strerror(n), n);
                 r->ok = false;
                 ctx->abort = true;
                 xTaskNotifyGive(ctx->prod_handle);   // unblock the producer so it can exit
                 break;
             }
 
-            hash = fnv1a(hash, g_pkt_dual[1], n);
+            hash = fnv1a(hash, g_pkt, n);
             if (pass >= 0) {
                 uint32_t c = t1 - t0;
                 sum_cycles += c;
                 if (c > max_cycles) max_cycles = c;
             }
         }
+        if (pass >= 0 && r->ok) sum_wall_us += (uint64_t)(esp_timer_get_time() - pass_start_us);
         if (pass == -1) ref_hash = hash;
         else if (hash != ref_hash) r->deterministic = false;
     }
 
     r->core1_avg_cycles = (uint32_t)(sum_cycles / (NUM_PASSES * NUM_FRAMES));
     r->core1_max_cycles = max_cycles;
+    r->wall_avg_us = (uint32_t)(sum_wall_us / (NUM_PASSES * NUM_FRAMES));
     r->hash = ref_hash;
 
     opus_encoder_destroy(enc);
@@ -610,6 +526,11 @@ static void dual_pipe_producer_core0(void *arg)
 {
     pipe_ctx_t *ctx = (pipe_ctx_t *)arg;
     xEventGroupWaitBits(ctx->eg, PIPE_GO, pdFALSE, pdTRUE, portMAX_DELAY);
+    if (ctx->abort) {
+        xEventGroupSetBits(ctx->eg, PIPE_PROD_DONE);
+        vTaskDelete(NULL);
+        return;
+    }
 
     uint64_t core0_cycles = 0;
     bool stop = false;
@@ -645,18 +566,31 @@ static void run_dual_core_pipeline(int complexity, dual_pipeline_result_t *r)
     ctx.complexity = complexity;
     ctx.res        = r;
     ctx.eg         = xEventGroupCreate();
+    if (ctx.eg == NULL) {
+        r->ok = false;
+        return;
+    }
 
     // The calling task (bench_task) runs on core 1, so the producer must be its own task on core 0.
-    xTaskCreatePinnedToCore(dual_pipe_consumer_core1, "pipe_c1", BENCH_TASK_STACK_BYTES,
-                            &ctx, 5, &ctx.cons_handle, 1);
-    xTaskCreatePinnedToCore(dual_pipe_producer_core0, "pipe_c0", 4096,
-                            &ctx, 5, &ctx.prod_handle, 0);
-
-    xEventGroupSetBits(ctx.eg, PIPE_GO);
+    BaseType_t consumer_created = xTaskCreatePinnedToCore(dual_pipe_consumer_core1,
+                                                           "pipe_c1", BENCH_TASK_STACK_BYTES,
+                                                           &ctx, 5, &ctx.cons_handle, 1);
+    BaseType_t producer_created = xTaskCreatePinnedToCore(dual_pipe_producer_core0,
+                                                           "pipe_c0", 4096,
+                                                           &ctx, 5, &ctx.prod_handle, 0);
+    if (consumer_created != pdPASS || producer_created != pdPASS) {
+        r->ok = false;
+        ctx.abort = true;
+        EventBits_t missing_done = 0;
+        if (consumer_created != pdPASS) missing_done |= PIPE_CONS_DONE;
+        if (producer_created != pdPASS) missing_done |= PIPE_PROD_DONE;
+        xEventGroupSetBits(ctx.eg, PIPE_GO | missing_done);
+    } else {
+        xEventGroupSetBits(ctx.eg, PIPE_GO);
+    }
     xEventGroupWaitBits(ctx.eg, PIPE_PROD_DONE | PIPE_CONS_DONE, pdFALSE, pdTRUE, portMAX_DELAY);
     vEventGroupDelete(ctx.eg);
 
-    r->wall_avg_us = r->core1_avg_cycles / esp_rom_get_cpu_ticks_per_us();
 }
 
 
@@ -677,6 +611,13 @@ static void bench_task(void *arg)
         printf("  complexity %d ...\n", k_complexities[i]);
         run_config(k_complexities[i], &g_res[i]);
         if (!g_res[i].ok) break;
+        if (k_complexities[i] == 0) {
+            for (int f = 0; f < NUM_FRAMES; f++) {
+                g_c0_frame_cycle_sum[f] = g_frame_cycle_sum[f];
+                g_c0_frame_bytes[f] = g_frame_bytes[f];
+                g_c0_frame_config[f] = g_frame_config[f];
+            }
+        }
         if (k_complexities[i] == PER_FRAME_LOG_COMPLEXITY) print_per_frame(k_complexities[i], cpu_mhz);
     }
 
@@ -726,53 +667,6 @@ static void bench_task(void *arg)
     printf("Task stack          : %u bytes allocated, %u bytes never used\n",
            (unsigned)BENCH_TASK_STACK_BYTES, (unsigned)uxTaskGetStackHighWaterMark(NULL));
 
-    // ---- Run Dual-Core Benchmarks ------------------------------------------
-    // Core 1 baselines are the sweep above. Core 0 also runs system tasks, so it gets its own
-    // single-stream baseline; otherwise core asymmetry would be reported as contention.
-    printf("\nRunning single-stream baselines on core 0...\n");
-    for (int i = 0; i < NUM_COMPLEXITIES; i++) {
-        printf("  core 0 alone, complexity %d ...\n", k_complexities[i]);
-        dual_parallel_result_t solo;
-        run_parallel_workers(k_complexities[i], 1, &solo);
-        g_core0_res[i] = solo.core[0];
-        g_core0_res[i].ok = solo.ok;
-    }
-
-    // printf("\nRunning Dual-Core Parallel (Core 0 + Core 1) complexity sweep...\n");
-    // for (int i = 0; i < NUM_COMPLEXITIES; i++) {
-    //     printf("  dual-core parallel complexity %d ...\n", k_complexities[i]);
-    //     run_dual_core_parallel(i, &g_dual_par_res[i]);
-    // }
-
-    printf("\n===== Dual-Core Parallel Benchmark (2 Simultaneous Streams: Core 0 + Core 1) =====\n");
-    printf("cplx | C0 avg cyc | C1 avg cyc | C0/C1 max us | contention C0/C1 (%%) | eff us/frame | streams avg/worst | both hashes vs single-stream\n");
-    for (int i = 0; i < NUM_COMPLEXITIES; i++) {
-        const dual_parallel_result_t *dr = &g_dual_par_res[i];
-        if (!dr->ok) {
-            printf("%4d | (failed - check heap)\n", dr->complexity);
-            continue;
-        }
-        uint32_t c0_max_us = dr->core[0].max_cycles / cpu_mhz;
-        uint32_t c1_max_us = dr->core[1].max_cycles / cpu_mhz;
-        bool hash_ok = (dr->core[0].hash == g_res[i].hash) && (dr->core[1].hash == g_res[i].hash);
-        printf("%4d | %10" PRIu32 " | %10" PRIu32 " | %5" PRIu32 " / %-5" PRIu32 " | %+7.2f / %+-7.2f | %8" PRIu32 " us | %5.2fx / %-5.2fx | %s (0x%08" PRIX32 ")\n",
-               dr->complexity,
-               dr->core[0].avg_cycles, dr->core[1].avg_cycles,
-               c0_max_us, c1_max_us,
-               dr->contention_pct[0], dr->contention_pct[1],
-               dr->wall_avg_us_per_frame,
-               dr->throughput_streams, dr->throughput_streams_worst,
-               hash_ok ? "MATCH" : "MISMATCH",
-               dr->core[0].hash);
-    }
-    printf("(Contention = a core's dual-run average vs. that same core encoding alone. Streams = real-time streams\n"
-           " the two cores sustain together, from the slower core's average / worst frame. Both cores encode identical\n"
-           " input in lockstep, the worst case for shared flash/SRAM contention.)\n");
-    printf("Dual-run heap used     : %u bytes incl. the 2 worker task stacks (min free 8-bit heap: %u bytes)\n",
-           (unsigned)g_dual_par_res[0].dual_heap_used,
-           (unsigned)g_dual_par_res[0].min_heap_free);
-    print_dual_stage_profile();
-
     printf("\nRunning Dual-Core Producer-Consumer Handoff (Complexity 0)...\n");
     run_dual_core_pipeline(0, &g_dual_pipe_res);
     if (!g_dual_pipe_res.ok) {
@@ -783,12 +677,14 @@ static void bench_task(void *arg)
         printf("Handoff C1 (APP) encode avg : %" PRIu32 " cycles (%.1f us), max: %" PRIu32 " cycles (%.1f us)\n",
                g_dual_pipe_res.core1_avg_cycles, (float)g_dual_pipe_res.core1_avg_cycles / (float)cpu_mhz,
                g_dual_pipe_res.core1_max_cycles, (float)g_dual_pipe_res.core1_max_cycles / (float)cpu_mhz);
+        printf("Handoff pipeline wall avg   : %" PRIu32 " us/frame\n", g_dual_pipe_res.wall_avg_us);
         printf("Handoff hash check          : 0x%08" PRIX32 " -> %s, %s\n",
                g_dual_pipe_res.hash,
                g_dual_pipe_res.hash == BASELINE_HASH_C0 ? "MATCH" : "DIFFERENT",
                g_dual_pipe_res.deterministic ? "deterministic" : "NOT deterministic");
         printf("(Core 0 only stages PCM; core 1 runs the whole encode. This measures handoff overhead, not a split of Opus stages.)\n");
     }
+    print_machine_results(cpu_mhz);
 
     printf("\nDone. Press EN to run again.\n");
     vTaskDelete(NULL);
