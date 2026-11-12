@@ -686,3 +686,102 @@ averaged 434 cycles (1.8 us); Core 1 encoding averaged 2,009,924 cycles (8.37 ms
 2,254,199-cycle (9.39 ms) maximum. Measured end-to-end handoff time was 8,499 us per frame.
 The packet hash was `0x317FC6D7` and remained deterministic. This handoff still uses the
 in-memory synthetic PCM; it is not the planned PC-to-device file stream.
+
+## 2026-11-11: repeated baseline protocol and IRAM placement of the SILK encode path
+
+Conditions for both runs below: ESP-IDF 6.1, ESP32-D0WD-V3 rev 3.1, 240 MHz, `-O2`,
+fixed-point Opus, 16 kHz mono, 20 ms frames, VOIP/voice, 20 kbps VBR, deterministic synthetic
+input, Opus stage-profile hooks compiled in. One complexity-0 run is a fresh encoder, one
+untimed warm-up pass, and 5 timed passes of 50 frames. The baseline repeats that run 10 times
+per boot (`run_baseline_repeats()` in `main/opus_benchmark_main.c`).
+
+The only intentional difference between the two runs is code placement. For the second run,
+`components/opus/linker.lf` maps the SILK fixed-point encode-path objects to IRAM with the
+`noflash_text` scheme (`LDFRAGMENTS "linker.lf"` in `components/opus/CMakeLists.txt`). Objects
+mapped: find_pitch_lags_FIX, pitch_analysis_core_FIX, noise_shape_analysis_FIX,
+find_pred_coefs_FIX, find_LPC_FIX, burg_modified_FIX, find_LTP_FIX, LTP_analysis_filter_FIX,
+LTP_scale_ctrl_FIX, corrMatrix_FIX, residual_energy_FIX, residual_energy16_FIX,
+regularize_correlations_FIX, vector_ops_FIX, autocorr_FIX, schur_FIX, schur64_FIX, k2a_FIX,
+k2a_Q16_FIX, apply_sine_window_FIX, process_gains_FIX, NSQ, NLSF_encode, NLSF_VQ,
+NLSF_VQ_weights_laroia, NLSF2A, A2NLSF, NLSF_stabilize, VQ_WMat_EC, LPC_analysis_filter,
+LPC_inv_pred_gain, bwexpander, bwexpander_32, encode_indices, encode_pulses, code_signs.
+
+### Complexity-0 baseline, 10 repeated runs
+
+| | Flash-resident (before) | SILK encode path in IRAM (after) |
+|---|---:|---:|
+| Median of run averages | 2,032,014 cycles (8,466.7 us) | 1,046,666 cycles (4,361.1 us) |
+| Run-average range | 2,032,006 to 2,032,312 (0.02 %) | 1,046,656 to 1,046,677 (0.00 %) |
+| Standard deviation | 95 cycles | 11 cycles |
+| Fastest / slowest frame | 1,577,095 / 2,302,846 cycles | 822,897 / 1,208,071 cycles |
+| Slowest frame time | 9,595 us | 5,034 us |
+| Output hash | 0x317FC6D7, all runs match | 0x317FC6D7, all runs match |
+| Free IRAM heap at boot | 87 KiB | 59 KiB |
+| Flash-mapped code segment | 211,400 bytes | 182,156 bytes |
+| Free DRAM after encoder destroy | 184,780 bytes | 184,780 bytes |
+
+Change in the median: -48.5 % (1.94x faster). About 29 KB of code moved (IRAM heap region shrank by
+29,024 bytes; the flash code segment shrank by 29,244 bytes). Within a boot the runs alternate
+between two nearly identical values, so the within-boot spread is effectively zero.
+
+### SILK stage profile, complexity 0 (cycles per frame, 250 timed frames)
+
+| Stage | Before | After | Change |
+|---|---:|---:|---:|
+| Pitch analysis | 360,322 | 181,643 | -49.6 % |
+| Noise-shape analysis | 207,003 | 82,609 | -60.1 % |
+| Predictor search (total) | 615,162 | 321,274 | -47.8 % |
+| NSQ quantizer | 264,656 | 194,002 | -26.7 % |
+| Entropy encoding | 108,810 | 50,582 | -53.5 % |
+| Gain processing | 24,569 | 8,352 | -66.0 % |
+| predictor: LPC (per call) | 203,362 | 112,888 | -44.5 % |
+| predictor: NLSF quantization (per call) | 225,861 | 91,473 | -59.5 % |
+| predictor: LTP (per call, 145 of 250 frames) | 171,288 | 110,202 | -35.7 % |
+| predictor: residual energy (per call) | 69,204 | 50,154 | -27.5 % |
+| SILK frame total | 1,625,415 | 880,498 | -45.8 % |
+| SILK API call total | 1,778,955 | 944,955 | -46.9 % |
+| Opus frame processing | 1,933,829 | 1,020,345 | -47.2 % |
+
+Share of the 1,044,908-cycle average encode after the change: predictor search 30.7 %, NSQ
+18.6 %, pitch analysis 17.4 %, noise-shape analysis 7.9 %, entropy encoding 4.8 %. Time outside
+the listed stages also fell: SILK API total minus SILK frame total went from 153,540 to 64,457
+cycles per frame, and the encode average minus Opus frame processing went from 96,833 to
+24,563. The contents of those remainders are not identified in the log.
+
+### Complexity sweep, average cycles per frame
+
+| Complexity | Before | After | Change | Hash |
+|---:|---:|---:|---:|:---|
+| 0 | 2,030,662 | 1,044,908 | -48.5 % | 0x317FC6D7 (unchanged) |
+| 2 | 2,498,992 | 1,626,827 | -34.9 % | 0xE56B6272 (unchanged) |
+| 5 | 3,260,991 | 2,411,650 | -26.0 % | 0x2550DE12 (unchanged) |
+| 10 | 5,821,873 | 4,981,622 | -14.4 % | 0x8949A3CB (unchanged) |
+
+Complexity 10 still misses real time on average (103.8 % average, 107.0 % worst-case load).
+
+### Producer-consumer handoff, complexity 0
+
+| | Before | After |
+|---|---:|---:|
+| Core 1 encode average | 2,028,915 cycles (8,453.8 us) | 1,056,171 cycles (4,400.7 us) |
+| Core 1 encode maximum | 2,292,422 cycles (9,551.8 us) | 1,187,924 cycles (4,949.7 us) |
+| Pipeline wall time per frame | 8,587 us | 4,596 us |
+| Core 0 staging average | 434 cycles | 434 cycles |
+| Hash | 0x317FC6D7, deterministic | 0x317FC6D7, deterministic |
+
+### Interpretation and caveats
+
+- The bitstream is unchanged at all four complexities, so the placement change did not alter
+  codec output.
+- The most likely explanation is that roughly half of the flash-resident cycles were
+  instruction-fetch stalls in the flash cache. This is indirect evidence: no cache-miss counters
+  were measured. The gain shrinking as complexity rises (code not moved, such as the tonality
+  analysis, still runs from flash) is consistent with that explanation.
+- NSQ improved least (-26.7 %). Its loops probably already stayed cache-resident, so its remaining
+  cycles are likely closer to real compute. This is an inference, not a measurement.
+- Entries earlier in this file were measured with the encode path running from flash and were
+  taken from different builds, with other source and instrumentation differences. Do not compare
+  them against the post-placement baseline. In particular, the `-O3` and `OPUS_XTENSA_LX7`
+  comparisons were made while cache behavior was part of the result and should be repeated on the
+  IRAM build before being relied on.
+- Cost of the change: about 29 KB of IRAM (free IRAM heap went from 87 KiB to 59 KiB).

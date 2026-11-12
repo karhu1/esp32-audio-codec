@@ -51,6 +51,7 @@ set(OPUS_COMPONENT_SOURCES
 idf_component_register(
     SRCS ${OPUS_COMPONENT_SOURCES}
     INCLUDE_DIRS "include"
+    LDFRAGMENTS "linker.lf"
     PRIV_INCLUDE_DIRS
         "src"
         "celt"

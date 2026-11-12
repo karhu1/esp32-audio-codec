@@ -56,6 +56,10 @@ static const int k_complexities[] = {0, 2, 5, 10};
 // Hash produced by the v1 baseline at complexity 0 (unmodified micro-opus build).
 #define BASELINE_HASH_C0      0x317FC6D7u
 
+// How many times the complexity-0 measurement is repeated in one boot to measure
+// run-to-run spread. Each run is ~2.5 s, so 10 runs is ~25 s.
+#define BASELINE_RUNS         10
+
 // Task stack. Higher complexity may use more stack than complexity 0 did, so this
 // is larger than the 16 KB v1 used. The result block prints how much was never used.
 #define BENCH_TASK_STACK_BYTES  (24 * 1024)
@@ -594,6 +598,86 @@ static void run_dual_core_pipeline(int complexity, dual_pipeline_result_t *r)
 }
 
 
+// ---- Repeated complexity-0 baseline ----------------------------------------
+// Repeats the complexity-0 measurement BASELINE_RUNS times in one boot so the
+// run-to-run spread is measured rather than guessed. Each run builds a fresh
+// encoder and does 1 warm-up pass + NUM_PASSES timed passes, exactly like the sweep.
+static void sort_u32(uint32_t *v, int n)
+{
+    for (int i = 1; i < n; i++) {
+        uint32_t key = v[i];
+        int j = i - 1;
+        while (j >= 0 && v[j] > key) { v[j + 1] = v[j]; j--; }
+        v[j + 1] = key;
+    }
+}
+
+static void run_baseline_repeats(const uint32_t cpu_mhz)
+{
+    static uint32_t run_avg[BASELINE_RUNS];
+    static uint32_t sorted[BASELINE_RUNS];
+    uint32_t overall_min = UINT32_MAX, overall_max = 0;
+    int n = 0;
+    bool all_match = true, all_det = true;
+
+    printf("\n===== Complexity-0 baseline: %d repeated runs =====\n", BASELINE_RUNS);
+    printf("Conditions : %u MHz, %s, Opus %s\n", (unsigned)cpu_mhz, opt_level_name(),
+           opus_get_version_string());
+    printf("Settings   : %d Hz mono, %d ms frames, %d bps VBR, VOIP/voice, complexity 0\n",
+           SAMPLE_RATE_HZ, FRAME_MS, BENCH_BITRATE);
+    printf("Per run    : 1 warm-up pass + %d timed passes of %d frames\n", NUM_PASSES, NUM_FRAMES);
+    printf("Note       : Opus stage-profile hooks are compiled in (components/opus/CMakeLists.txt)\n");
+    printf("run, avg_cycles, min_cycles, max_cycles, hash, deterministic\n");
+
+    for (int i = 0; i < BASELINE_RUNS; i++) {
+        result_t r;
+        run_config(0, &r);
+        if (!r.ok || r.timed_frames == 0) {
+            printf("%d, (failed)\n", i);
+            break;
+        }
+        run_avg[n++] = r.avg_cycles;
+        if (r.min_cycles < overall_min) overall_min = r.min_cycles;
+        if (r.max_cycles > overall_max) overall_max = r.max_cycles;
+        if (r.hash != BASELINE_HASH_C0) all_match = false;
+        if (!r.deterministic) all_det = false;
+        printf("%d, %" PRIu32 ", %" PRIu32 ", %" PRIu32 ", 0x%08" PRIX32 ", %s\n",
+               i, r.avg_cycles, r.min_cycles, r.max_cycles, r.hash,
+               r.deterministic ? "yes" : "NO");
+        vTaskDelay(pdMS_TO_TICKS(50));   // let other tasks and the watchdog run between runs
+    }
+
+    if (n < 2) {
+        printf("Baseline summary: not enough successful runs (%d).\n", n);
+        return;
+    }
+
+    for (int i = 0; i < n; i++) sorted[i] = run_avg[i];
+    sort_u32(sorted, n);
+    uint32_t median = (n & 1) ? sorted[n / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2;
+    uint32_t avg_min = sorted[0], avg_max = sorted[n - 1];
+
+    double mean = 0.0;
+    for (int i = 0; i < n; i++) mean += run_avg[i];
+    mean /= n;
+    double var = 0.0;
+    for (int i = 0; i < n; i++) var += ((double)run_avg[i] - mean) * ((double)run_avg[i] - mean);
+    double stddev = sqrt(var / (n - 1));
+
+    printf("\n--- Baseline summary (complexity 0, %d runs) ---\n", n);
+    printf("Median of run averages : %" PRIu32 " cycles (%.1f us)\n", median, (double)median / cpu_mhz);
+    printf("Run-average range      : %" PRIu32 " .. %" PRIu32 " cycles (spread %.2f %% of median)\n",
+           avg_min, avg_max, 100.0 * (double)(avg_max - avg_min) / (double)median);
+    printf("Mean +/- stddev        : %.0f +/- %.0f cycles (%.2f %%)\n", mean, stddev, 100.0 * stddev / mean);
+    printf("Fastest / slowest frame: %" PRIu32 " / %" PRIu32 " cycles (%.1f us worst, budget %d us)\n",
+           overall_min, overall_max, (double)overall_max / cpu_mhz, FRAME_MS * 1000);
+    printf("Output hash            : %s (expected 0x%08X), %s\n",
+           all_match ? "all runs MATCH" : "MISMATCH in at least one run",
+           (unsigned)BASELINE_HASH_C0, all_det ? "deterministic" : "NOT deterministic");
+    printf("Rule of thumb: a change only counts as a real improvement if its median beats the\n"
+           "median above by more than the run-average range.\n");
+}
+
 static void bench_task(void *arg)
 {
     (void)arg;
@@ -666,6 +750,8 @@ static void bench_task(void *arg)
            (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT));
     printf("Task stack          : %u bytes allocated, %u bytes never used\n",
            (unsigned)BENCH_TASK_STACK_BYTES, (unsigned)uxTaskGetStackHighWaterMark(NULL));
+
+    run_baseline_repeats(cpu_mhz);
 
     printf("\nRunning Dual-Core Producer-Consumer Handoff (Complexity 0)...\n");
     run_dual_core_pipeline(0, &g_dual_pipe_res);
