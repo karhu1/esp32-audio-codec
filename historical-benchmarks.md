@@ -785,3 +785,124 @@ Complexity 10 still misses real time on average (103.8 % average, 107.0 % worst-
   comparisons were made while cache behavior was part of the result and should be repeated on the
   IRAM build before being relied on.
 - Cost of the change: about 29 KB of IRAM (free IRAM heap went from 87 KiB to 59 KiB).
+
+## 2026-11-19: USB streaming mode on real audio, link reliability, and real-input cycle statistics
+
+Conditions for all runs below: ESP-IDF 6.1, ESP32-D0WD-V3 rev 3.1, 240 MHz, `-O2`, fixed-point
+Opus, 16 kHz mono, 20 ms frames, VOIP/voice, 20 kbps VBR, complexity 0, Opus stage-profile hooks
+compiled in, SILK encode path in IRAM (`components/opus/linker.lf` as in the 2026-11-11 entry; it
+was not edited, but `idf.py size` and free IRAM were not recorded for the stream builds). Firmware
+built with `idf.py -DAPP_MODE=stream`. Input is an MP3 decoded and resampled to 16 kHz mono by
+`miniaudio` on the PC (`tools/stream_mp3.py`), sent over the CP2102 UART bridge with a credit
+window of 8 frames. Encode cycles are counted on core 1 around `opus_encode()` only, so the link
+speed does not enter them. The PC checks frame count, byte count, and an FNV-1a hash of all
+packets against the board's own values; every run recorded as a pass matched on all three.
+
+### Firmware builds
+
+| Build | Changes relative to the previous build |
+|---|---|
+| A (original) | First working stream firmware and script. RX ring 4,096 bytes; script times out after 5 s. |
+| B (diagnostics) | UART RX ring 8,192 bytes. A CRC failure reports the expected PCM sequence number. A frame cut short for over 100 ms during a session now sends an error instead of staying silent. Script timeout 12 s; errors and timeouts print frames sent, packets received, and whether END was sent. |
+| C (END resend) | B plus: the PC resends END after 1 s of silence once all packets are in (at most 4 times); the board stays at the high baud rate for 6 s after DONE and answers a repeated END with DONE; the PC sends a BYE frame (type 0x04) after DONE so the board returns to 115200 at once. |
+
+### Inputs and first streamed runs (921600 baud, Build A)
+
+| Input | Frames / audio | Wall time | Speed | Output bytes | Average bitrate | Output hash |
+|---|---|---:|---:|---:|---:|:---|
+| `5-sec.mp3` | 257 / 5.1 s | 2.74 s | 1.88x | 10,091 | 15,706 bps | 0x6926A3A0 |
+| `steve-lacy-oh-yeah.mp3` (song) | 8,487 / 169.7 s | 88.76 s | 1.91x | 404,990 | 19,088 bps | 0x747CE95C |
+| `english-together-3-min.mp3` (conversation) | 9,264 / 185.3 s | see below | see below | 384,499 | 16,602 bps | 0xD18954DF |
+
+| Input | Min cycles | Average cycles | Max cycles | Average time | Max time (share of 20 ms) |
+|---|---:|---:|---:|---:|---:|
+| `5-sec.mp3` | 835,560 | 1,016,967 | 1,249,578 | 4,237 us | 5,207 us (26.0 %) |
+| `steve-lacy-oh-yeah.mp3` | 836,460 | 1,099,033 | 1,345,941 | 4,579 us | 5,608 us (28.0 %) |
+| Synthetic baseline (2026-11-11) | 822,897 | 1,046,666 | 1,208,071 | 4,361 us | 5,034 us (25.2 %) |
+
+### Conversation file: all recorded passes
+
+Same input, same hash (0xD18954DF) and byte count (384,499) in every pass, across both baud rates
+and all three builds.
+
+| # | Build | Baud | Wall time | Speed | Min cycles | Avg cycles | Max cycles |
+|---:|:---:|---:|---:|---:|---:|---:|---:|
+| 1 | A | 460800 | 144.80 s | 1.28x | 834,456 | 1,082,973 | 1,361,988 |
+| 2 | A | 460800 | 144.51 s | 1.28x | 834,504 | 1,082,988 | 1,360,854 |
+| 3 | A | 460800 | 143.92 s | 1.29x | 826,887 | 1,082,965 | 1,362,819 |
+| 4 | B | 921600 | 96.54 s | 1.92x | 832,567 | 1,080,058 | 1,360,224 |
+| 5 | B | 921600 | 97.01 s | 1.91x | 827,870 | 1,079,191 | 1,356,436 |
+| 6 | C | 921600 | 96.77 s | 1.91x | 820,180 | 1,067,875 | 1,353,173 |
+| 7 | C | 921600 | 97.11 s | 1.91x | 820,210 | 1,068,863 | 1,343,776 |
+| 8 | C | 921600 | 97.01 s | 1.91x | 822,994 | 1,068,048 | 1,343,788 |
+| 9 | C | 460800 | 144.70 s | 1.28x | 822,976 | 1,066,973 | 1,342,766 |
+| 10 | C | 460800 | 144.24 s | 1.28x | 822,976 | 1,068,013 | 1,343,761 |
+
+Across the ten passes: average 1,066,973 to 1,082,988 cycles (about 4,446 to 4,512 us), fastest
+frame 820,180 to 834,504, slowest frame 1,342,766 to 1,362,819 cycles (5,595 to 5,678 us, up to
+28.4 % of the 20 ms budget). Only passes are listed; the five failed runs below produced no
+statistics that were recorded.
+
+### Conversation file: failed runs (all at 921600 baud)
+
+| # | Build | Result |
+|---:|:---:|:---|
+| F1 | A | `Board error: bad frame (CRC) (code 1, detail 0)`; last progress line printed 7,100 of 9,264 |
+| F2 | A | Timed out waiting for the board, 9,263 of 9,264 packets received |
+| F3 | A | Timed out waiting for the board, 9,264 of 9,264 packets received (DONE missing) |
+| F4 | B | Timed out after 12 s: 9,264 of 9,264 packets received, 9,264 PCM sent, END sent, no error from the board |
+| F5 | C | `Out-of-order packet: got seq 7148, expected 7147`; last progress line printed 7,100 |
+
+Tally for the conversation file: 921600 baud, Build A 0 of 3 passed, Build B 2 of 3, Build C 3 of
+4; 460800 baud, 5 of 5 passed (Build A 3, Build C 2). The song and the 5-second clip passed their
+single recorded runs at 921600 on Build A. No run in the table above printed an `END resends`
+line, so the END-resend path was not exercised by any recorded pass. Only the runs shown to me are
+recorded here; the default baud rate in `tools/stream_mp3.py` was then changed to 460800.
+
+### Interpretation and caveats
+
+- The encoder output is bit-identical across link speeds and firmware builds, and every pass
+  verified end to end. The failures were all caught by the protocol (CRC, sequence check, or
+  timeout); none produced a silently wrong file.
+- The cause of the 921600 failures is not identified. The first failure was reported by the
+  board (PC to board direction). F5 is consistent with a lost or corrupted PACKET on the way
+  back, because the board reported no error; this is an inference, since the PC parser drops a
+  bad-CRC frame without saying so. F3 and F4 both lost only DONE. No UART error counters were
+  measured, so the CP2102, the cable, the host USB stack, and UART interrupt latency on the
+  ESP32 are all still possible. The two mid-stream failures (F1, F5) both fell in frames 7,100 to
+  7,199; whether that is chance or something in the audio was not checked.
+- At 460800 baud 5 of 5 passes on the file that failed at 921600, so it is the default for now.
+  Five passes is a small sample if the 921600 failure rate is about one in three.
+- Throughput is set by the link, not the encoder, at 460800: a 649-byte PCM frame takes about
+  14.1 ms on the wire and the measured time is about 15.6 ms per frame. At 921600 the wire time
+  is 7.0 ms and the measured time is about 10.4 ms per frame, with about 4.5 ms of that being
+  encode, so raw wire time does not explain the figure alone. The remainder was not isolated.
+- Average cycles shifted between builds while the input, hash, and encoder code stayed the same:
+  about 1,082,975 (Build A), 1,079,600 (B), 1,068,000 (C), a 1.4 % drop from A to C. Within
+  Build C the two baud rates agree to 0.1 %, so the shift follows the build, not the link. Builds
+  differ in core 0 code and buffer sizes, so code and data layout is the likely cause, but it was
+  not isolated. Treat this as an accidental layout-sensitivity data point for the measurement
+  rules: differences of about 1 to 2 % between builds are not evidence of an optimization.
+- Against the synthetic baseline average of 1,046,666, the 5 s clip is 2.8 % lower, the
+  conversation 1.9 to 3.5 % higher, and the song 5.0 % higher. On the two long inputs the slowest
+  frame is 11 to 13 % above the synthetic worst case (1,208,071), so the synthetic signal
+  understated peak cost (the 5 s clip's slowest frame is only 3.4 % above). The fastest real
+  frames (820,180 to 836,460) are close to the synthetic fastest frame (822,897), which suggests a
+  per-frame floor that does not depend much on the input. That last point is an inference from
+  three inputs.
+- The song is not speech and the encoder is forced to the voice signal type, so only the
+  conversation is close to the intended use.
+- Projection to verify, not a result: the conversation's slowest frame, 1,362,819 cycles, would
+  take about 17.0 ms (85 % of the budget) at 80 MHz and about 8.5 ms (43 %) at 160 MHz if cycles
+  per frame stay constant. This replaces the earlier 80 MHz projection of 15.1 ms, which used the
+  synthetic worst case. Cycle counts may change with clock speed.
+### Not yet recorded
+
+- Heap free size and stack high-water marks for the three stream tasks.
+- Sequence-number wraparound (65,536 frames, about 21.8 minutes); the longest run is 9,264
+  frames.
+- Whether a task watchdog message appeared during the long runs. Each session occupies the console
+  UART, so a message would not be visible to the script; no abort occurred.
+- Listening results: the user reported that the 5 s output plays; no quality notes were
+  recorded for the conversation or song output.
+- `idf.py size` output, free IRAM, and the per-frame CSV contents for the stream builds.
